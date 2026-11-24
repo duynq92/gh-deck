@@ -1,6 +1,6 @@
 //! Application state and key handling.
 
-use crate::api::{self, Choice, Detail, Item, Page, Query, Repos, Reviews};
+use crate::api::{self, Candidates, Choice, Detail, Item, Page, Query, Repos, Reviews};
 use crate::doc::Doc;
 use crate::form::{self, Form};
 use crate::gh::{self, Cmd, GhError, Result};
@@ -30,6 +30,12 @@ pub enum Msg {
         job: u64,
         repo: String,
         result: Result<Vec<(String, String)>>,
+    },
+    Reviewers {
+        job: u64,
+        repo: String,
+        number: u64,
+        result: Result<Candidates>,
     },
     Done {
         tab: Tab,
@@ -78,6 +84,11 @@ pub enum Pick {
     State,
     Target(Act),
     Workflow(String),
+    Reviewers {
+        repo: String,
+        number: u64,
+        requested: Vec<String>,
+    },
 }
 
 pub struct Picker {
@@ -96,7 +107,7 @@ impl Picker {
     pub fn multi(&self) -> bool {
         matches!(
             self.pick,
-            Pick::Org | Pick::Scope | Pick::Filter | Pick::State
+            Pick::Org | Pick::Scope | Pick::Filter | Pick::State | Pick::Reviewers { .. }
         )
     }
 
@@ -128,7 +139,14 @@ impl Picker {
     fn chosen(&self) -> Option<Vec<Choice>> {
         let marked: Vec<String> = match (self.touched, self.moved) {
             (true, _) => self.marked.clone(),
-            (false, true) => vec![self.view().get(self.sel)?.1.clone()],
+            (false, true) => {
+                let mut one = vec![self.view().get(self.sel)?.1.clone()];
+                // Asking one more person must not withdraw the others.
+                if matches!(self.pick, Pick::Reviewers { .. }) {
+                    one.extend(self.marked.iter().cloned());
+                }
+                one
+            }
             (false, false) => return None,
         };
         Some(
@@ -451,7 +469,24 @@ impl App {
                     Err(e) => self.error(e),
                 }
             }
-            Msg::Doc { .. } | Msg::Workflows { .. } => {}
+            Msg::Reviewers {
+                job,
+                repo,
+                number,
+                result,
+            } if job == self.pick_job => {
+                self.busy = None;
+                match result {
+                    Ok(c) if !c.mine => self.error("only your own pull requests"),
+                    Ok(c) if self.modal.is_none() => {
+                        self.finding = false;
+                        self.pick_reviewers(repo, number, c);
+                    }
+                    Ok(_) => {}
+                    Err(e) => self.error(e),
+                }
+            }
+            Msg::Doc { .. } | Msg::Workflows { .. } | Msg::Reviewers { .. } => {}
             Msg::Done {
                 tab,
                 label,
@@ -764,6 +799,28 @@ impl App {
                     result: api::checkout(&item).map(|_| String::new()),
                 });
             }
+            Act::Reviewers => {
+                let Item::Ticket(t) = &item else { return };
+                if !self.is_mine(&item) {
+                    return self.error("you can choose reviewers only for PRs opened by you");
+                }
+                if t.state != "OPEN" {
+                    return self.error(format!("{} is {}", item.id(), item.state()));
+                }
+                if let Some(busy) = &self.busy {
+                    self.status = Some(Status::Error(format!("still running: {busy}")));
+                    return;
+                }
+                self.busy = Some(format!("Loading reviewers for {}", item.id()));
+                self.pick_job += 1;
+                let (job, repo, number) = (self.pick_job, t.repo.clone(), t.number);
+                self.spawn(move || Msg::Reviewers {
+                    job,
+                    result: api::candidates(&repo, number),
+                    repo,
+                    number,
+                });
+            }
             Act::Merge if item.state() != "open" => {
                 self.error(format!("cannot merge a {} pull request", item.state()));
             }
@@ -796,6 +853,42 @@ impl App {
             });
         } else if let Some(form) = Form::new(self.tab, act, &repo, None, "") {
             self.modal = Some(Modal::Form(Box::new(form)));
+        }
+    }
+
+    /// Whether the user opened the item. Unknown until the login is loaded, and
+    /// checked again by GitHub before anything is changed.
+    pub fn is_mine(&self, item: &Item) -> bool {
+        match (item, &self.repos) {
+            (Item::Ticket(t), Some(r)) => t.author.as_ref() == Some(&r.login),
+            (Item::Ticket(_), None) => true,
+            _ => false,
+        }
+    }
+
+    fn pick_reviewers(&mut self, repo: String, number: u64, c: Candidates) {
+        let (mut items, others): (Vec<Choice>, Vec<Choice>) = c
+            .people
+            .into_iter()
+            .partition(|p| c.requested.contains(&p.1));
+        for login in &c.requested {
+            if !items.iter().any(|i| &i.1 == login) {
+                items.push((login.clone(), login.clone()));
+            }
+        }
+        items.extend(others);
+        if items.is_empty() {
+            return self.error(format!("nobody else can review in {repo}"));
+        }
+        let title = format!("Reviewers of {repo}#{number}");
+        let pick = Pick::Reviewers {
+            repo,
+            number,
+            requested: c.requested.clone(),
+        };
+        self.picker(title, items, 0, pick);
+        if let Some(Modal::Picker(p)) = &mut self.modal {
+            p.marked = c.requested;
         }
     }
 
@@ -991,13 +1084,24 @@ impl App {
                 self.list_mut().states = chosen;
                 self.reset();
             }
+            Pick::Reviewers {
+                repo,
+                number,
+                requested,
+            } => {
+                let chosen: Vec<String> = chosen.into_iter().map(|c| c.1).collect();
+                match api::request_reviews(&repo, number, &requested, &chosen) {
+                    Some(cmd) => self.modal = Some(Modal::Confirm(cmd)),
+                    None => self.info("reviewers unchanged"),
+                }
+            }
             Pick::Target(_) | Pick::Workflow(_) => {}
         }
     }
 
     fn picked(&mut self, pick: Pick, value: String) {
         match pick {
-            Pick::Org | Pick::Scope | Pick::Filter | Pick::State => {}
+            Pick::Org | Pick::Scope | Pick::Filter | Pick::State | Pick::Reviewers { .. } => {}
             Pick::Target(act) => self.target(act, value),
             Pick::Workflow(repo) => {
                 if let Some(form) = Form::new(self.tab, Act::Trigger, &repo, None, &value) {
@@ -1189,5 +1293,42 @@ mod tests {
         );
         assert_eq!(app.list().states.len(), 2);
         assert_eq!(app.list().states[0].0, "Merged");
+    }
+
+    #[test]
+    fn choosing_a_reviewer_keeps_the_others_and_asks() {
+        let candidates = || Candidates {
+            mine: true,
+            requested: vec!["o/team".into()],
+            people: vec![("al".into(), "al".into()), ("bo".into(), "bo".into())],
+        };
+        let label = |app: &App| match &app.modal {
+            Some(Modal::Confirm(cmd)) => cmd.label.clone(),
+            _ => String::new(),
+        };
+        let mut app = app();
+        app.pick_reviewers("o/r".into(), 7, candidates());
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(label(&app), "o/r#7: request review from al");
+        press(&mut app, KeyCode::Char('n'));
+        app.pick_reviewers("o/r".into(), 7, candidates());
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(label(&app), "o/r#7: withdraw request to o/team");
+        assert!(app.busy.is_none());
+    }
+
+    #[test]
+    fn reviewers_only_for_my_pull_requests() {
+        let mut app = app();
+        app.listed(Tab::Prs, 0, false, page(&[1]));
+        app.repos = Some(Repos {
+            login: "me".into(),
+            ..Repos::default()
+        });
+        press(&mut app, KeyCode::Char('v'));
+        assert!(app.busy.is_none());
+        assert!(matches!(app.status, Some(Status::Error(_))));
     }
 }

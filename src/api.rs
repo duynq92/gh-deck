@@ -973,6 +973,132 @@ fn lines(text: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Who can be asked to review a pull request.
+#[derive(Debug, Default)]
+pub struct Candidates {
+    pub mine: bool,
+    /// Logins and `org/team`s asked so far.
+    pub requested: Vec<String>,
+    pub people: Vec<Choice>,
+}
+
+pub fn candidates(repo: &str, number: u64) -> Result<Candidates> {
+    #[derive(Deserialize)]
+    struct Out {
+        mine: bool,
+        author: Option<String>,
+        requested: Vec<String>,
+        cursor: Option<String>,
+        people: Vec<(String, Option<String>)>,
+    }
+    let (owner, name) = split(repo)?;
+    let mut all = Candidates::default();
+    let mut after: Option<String> = None;
+    for _ in 0..5 {
+        let (owner, name) = (format!("o={owner}"), format!("n={name}"));
+        let number = format!("number={number}");
+        let mut list = vec![
+            "api",
+            "graphql",
+            "-f",
+            "query=query($o:String!,$n:String!,$number:Int!,$after:String){\
+             repository(owner:$o,name:$n){pullRequest(number:$number){viewerDidAuthor \
+             author{login} reviewRequests(first:100){nodes{requestedReviewer{\
+             ...on User{login} ...on Bot{login} ...on Mannequin{login} \
+             ...on Team{combinedSlug}}}}} \
+             assignableUsers(first:100,after:$after){pageInfo{hasNextPage endCursor} \
+             nodes{login name}}}}",
+            "-f",
+            &owner,
+            "-f",
+            &name,
+            "-F",
+            &number,
+            "--jq",
+            ".data.repository|{mine:.pullRequest.viewerDidAuthor,\
+             author:.pullRequest.author.login,\
+             requested:[.pullRequest.reviewRequests.nodes[].requestedReviewer|select(.)\
+             |(.login//.combinedSlug)],\
+             cursor:(.assignableUsers.pageInfo|if .hasNextPage then .endCursor else null end),\
+             people:[.assignableUsers.nodes[]|[.login,.name]]}",
+        ];
+        if let Some(after) = &after {
+            list.extend(["-f", after]);
+        }
+        let out: Out = fetch(&list)?;
+        all.mine = out.mine;
+        all.requested = out.requested;
+        // Nobody can review their own pull request.
+        let others = out
+            .people
+            .into_iter()
+            .filter(|p| Some(&p.0) != out.author.as_ref());
+        all.people.extend(others.map(|(login, name)| {
+            let label = match name {
+                Some(name) if !name.is_empty() => format!("{login}  ({name})"),
+                _ => login.clone(),
+            };
+            (label, login)
+        }));
+        match out.cursor {
+            Some(cursor) => after = Some(format!("after={cursor}")),
+            None => break,
+        }
+    }
+    let teams = repo_teams(repo, owner)?;
+    all.people
+        .extend(teams.into_iter().map(|t| (format!("{t}  (team)"), t)));
+    Ok(all)
+}
+
+/// Teams with access, or every team of the organization when GitHub does not
+/// let the user see who has access.
+fn repo_teams(repo: &str, owner: &str) -> Result<Vec<String>> {
+    let exact: Result<Vec<String>> = fetch(&[
+        "api",
+        &format!("repos/{repo}/teams?per_page=100"),
+        "--jq",
+        "[.[].slug]",
+    ]);
+    if let Ok(slugs) = exact {
+        return Ok(slugs.iter().map(|s| format!("{owner}/{s}")).collect());
+    }
+    fetch(&[
+        "api",
+        "graphql",
+        "-f",
+        "query=query($o:String!){repositoryOwner(login:$o){\
+         ...on Organization{teams(first:100){nodes{combinedSlug}}}}}",
+        "-f",
+        &format!("o={owner}"),
+        "--jq",
+        "[.data.repositoryOwner.teams.nodes[]?.combinedSlug]",
+    ])
+}
+
+/// Ask for and withdraw reviews; `None` when nothing changes.
+pub fn request_reviews(repo: &str, number: u64, old: &[String], new: &[String]) -> Option<Cmd> {
+    let missing = |a: &[String], b: &[String]| -> Vec<String> {
+        a.iter().filter(|x| !b.contains(x)).cloned().collect()
+    };
+    let (add, remove) = (missing(new, old), missing(old, new));
+    let mut list = args(&["pr", "edit", &number.to_string(), &format!("--repo={repo}")]);
+    let mut what = Vec::new();
+    if !add.is_empty() {
+        list.push(format!("--add-reviewer={}", add.join(",")));
+        what.push(format!("request review from {}", add.join(", ")));
+    }
+    if !remove.is_empty() {
+        list.push(format!("--remove-reviewer={}", remove.join(",")));
+        what.push(format!("withdraw request to {}", remove.join(", ")));
+    }
+    (!what.is_empty()).then(|| Cmd {
+        label: format!("{repo}#{number}: {}", what.join("; ")),
+        args: list,
+        stdin: None,
+    })
+}
+
 /// Commands that need only a confirmation.
 pub fn simple(act: Act, item: &Item) -> Option<Cmd> {
     let repo = item.repo();
@@ -1340,5 +1466,26 @@ mod tests {
         );
         t.state = "MERGED".into();
         assert_eq!(simple(Act::Toggle, &Item::Ticket(t)), None);
+    }
+
+    #[test]
+    fn review_requests_are_diffed() {
+        let list = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+        let old = list(&["al", "o/team"]);
+        assert_eq!(request_reviews("o/r", 7, &old, &old), None);
+        let cmd = request_reviews("o/r", 7, &old, &list(&["al", "bo", "o/x"])).unwrap();
+        assert_eq!(
+            cmd.args[2..],
+            [
+                "7",
+                "--repo=o/r",
+                "--add-reviewer=bo,o/x",
+                "--remove-reviewer=o/team"
+            ]
+        );
+        assert_eq!(
+            cmd.label,
+            "o/r#7: request review from bo, o/x; withdraw request to o/team"
+        );
     }
 }
