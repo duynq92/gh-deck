@@ -101,7 +101,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 fn draw_body(frame: &mut Frame, app: &mut App, body: Rect) {
-    let split = if body.width >= 180 {
+    let split = if app.tab == Tab::Prs && body.width >= 120 {
+        // Reading the changes matters most.
+        Layout::horizontal([Constraint::Ratio(1, 3), Constraint::Fill(1)])
+    } else if body.width >= 180 {
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
     } else if body.height >= 24 {
         // Stacked panes give columns and code the full width.
@@ -338,34 +341,65 @@ struct Columns {
 impl Columns {
     fn new(tab: Tab, width: usize, scoped: bool) -> Self {
         let ticket = matches!(tab, Tab::Prs | Tab::Issues);
-        let pr = tab == Tab::Prs;
+        if tab == Tab::Prs {
+            return Columns::pull_requests(width, scoped);
+        }
         let mut c = Columns {
             state: if ticket { 6 } else { 11 },
             repo: if scoped { 0 } else { (width / 6).min(22) },
             id: if ticket { 6 } else { (width / 6).min(16) },
-            checks: if pr { 1 } else { 0 },
+            checks: 0,
             title: 0,
-            reviewers: match width {
-                _ if !pr => 0,
-                130.. => 30,
-                100.. => 22,
-                _ => 14,
-            },
-            approval: if pr { 10 } else { 0 },
+            reviewers: 0,
+            approval: 0,
             date: 11,
         };
-        let used =
-            |c: &Columns| -> usize { c.widths().iter().filter(|w| **w > 0).map(|w| w + 1).sum() };
         // Drop what matters least until the title has room.
-        if width < used(&c) + 22 {
+        if width < c.used() + 22 {
             c.date = 0;
         }
-        if width < used(&c) + 18 {
+        if width < c.used() + 18 {
             c.repo = c.repo.min(8);
-            c.reviewers = c.reviewers.min(10);
         }
-        c.title = width.saturating_sub(used(&c));
+        c.title = width.saturating_sub(c.used());
         c
+    }
+
+    /// Narrow lists show the state as a letter and the approval as a mark.
+    fn pull_requests(width: usize, scoped: bool) -> Self {
+        let wide = width >= 90;
+        let mut c = Columns {
+            state: if wide { 6 } else { 1 },
+            repo: match (scoped, wide) {
+                (true, _) => 0,
+                (_, true) => (width / 9).min(14),
+                _ => (width / 6).clamp(6, 10),
+            },
+            id: 6,
+            checks: 1,
+            title: 0,
+            reviewers: match width {
+                130.. => 30,
+                100.. => 22,
+                90.. => 14,
+                60.. => 12,
+                _ => 8,
+            },
+            approval: if wide { 10 } else { 1 },
+            date: 0,
+        };
+        if width < c.used() + 14 {
+            c.reviewers = 0; // the info panel names them
+        }
+        c.title = width.saturating_sub(c.used());
+        c
+    }
+
+    /// Columns taken by everything but the title, with separators.
+    fn used(&self) -> usize {
+        let widths = self.widths();
+        let shown = widths.iter().filter(|w| **w > 0);
+        shown.map(|w| w + 1).sum::<usize>()
     }
 
     fn widths(&self) -> [usize; 7] {
@@ -388,13 +422,16 @@ impl Columns {
         };
         let mut spans = Vec::new();
         for (name, width) in [
-            ("STATE", self.state),
+            (if self.state > 1 { "STATE" } else { "S" }, self.state),
             ("REPO", self.repo),
             (id, self.id),
             ("C", self.checks),
             ("TITLE", self.title),
             ("REVIEWERS", self.reviewers),
-            ("APPROVAL", self.approval),
+            (
+                if self.approval > 1 { "APPROVAL" } else { "A" },
+                self.approval,
+            ),
             ("UPDATED", self.date),
         ] {
             cell(&mut spans, name, width, Style::new());
@@ -419,7 +456,9 @@ impl Columns {
         };
         let date = api::date(item.updated());
         let mut s = Vec::new();
-        cell(&mut s, state, self.state, state_style(state));
+        let letter = state.get(..1).unwrap_or("").to_uppercase();
+        let name = if self.state > 1 { state } else { &letter };
+        cell(&mut s, name, self.state, state_style(state));
         cell(&mut s, repo, self.repo, Style::new().fg(Color::Blue));
         cell(&mut s, &id, self.id, Style::new().fg(ACCENT));
         let (mark, style) = check_mark(reviews.and_then(|r| r.checks.as_deref()));
@@ -429,7 +468,14 @@ impl Columns {
             reviewer_cell(&mut s, reviews, self.reviewers);
         }
         let approval = reviews.map_or("…", |r| r.approval());
-        cell(&mut s, approval, self.approval, mark_style(approval));
+        let style = mark_style(approval);
+        let mark = approval.get(..approval.chars().next().map_or(0, char::len_utf8));
+        let text = if self.approval > 1 {
+            approval
+        } else {
+            mark.unwrap_or("")
+        };
+        cell(&mut s, text, self.approval, style);
         cell(&mut s, date.get(5..).unwrap_or(""), self.date, DIM);
         Line::from(s)
     }
@@ -461,6 +507,21 @@ fn reviewer_cell(spans: &mut Vec<Span<'static>>, reviews: Option<&Reviews>, widt
     let all = &reviews.reviewers;
     if all.is_empty() {
         return cell(spans, "-", width, DIM);
+    }
+    if width <= 8 && all.len() > 1 {
+        // No room for names: count them by state.
+        let mut left = width;
+        for mark in ['✗', '✓', '●', '·', '-'] {
+            let count = all.iter().filter(|r| r.mark() == mark).count();
+            let text = format!("{mark}{count} ");
+            if count > 0 && text.width() - 1 <= left {
+                let len = text.width().min(left);
+                spans.push(Span::styled(fit(text.trim_end(), len), mark_style(&text)));
+                left -= len;
+            }
+        }
+        spans.push(Span::raw(" ".repeat(left + 1)));
+        return;
     }
     let mut left = width;
     for (n, r) in all.iter().enumerate() {
@@ -829,6 +890,8 @@ fn draw_help(frame: &mut Frame, tab: Tab) {
     }
     if tab == Tab::Prs {
         lines.push(Line::raw(""));
+        let columns = " COLUMNS  S state: Open, Draft, Merged, Closed   C checks   A approval";
+        lines.push(Line::raw(columns));
         let marks = [
             "✓ approved",
             "✗ changes",
@@ -1132,7 +1195,7 @@ mod tests {
                     .collect(),
                 ..Reviews::default()
             };
-            for width in [5, 10, 14, 30] {
+            for width in [5, 8, 10, 14, 30] {
                 let mut spans = Vec::new();
                 reviewer_cell(&mut spans, Some(&reviews), width);
                 let got: usize = spans.iter().map(Span::width).sum();
