@@ -1,16 +1,18 @@
-//! The one saved setting: teams to leave out of "my teams".
+//! Saved settings: teams to leave out of "my teams", and what was shown last.
 
-use crate::api::valid_repo;
+use crate::api::{self, Choice, valid_repo};
+use crate::keys::Tab;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::{env, fs, io};
 
-/// `$XDG_CONFIG_HOME/ghdeck/excluded-teams`, or below `~/.config`.
-pub fn path() -> Option<PathBuf> {
+/// `$XDG_CONFIG_HOME/ghdeck/NAME`, or below `~/.config`.
+pub fn path(name: &str) -> Option<PathBuf> {
     let dir = |name| env::var_os(name).map(PathBuf::from);
     let base = dir("XDG_CONFIG_HOME")
         .filter(|p| p.is_absolute())
         .or_else(|| dir("HOME").map(|home| home.join(".config")))?;
-    Some(base.join("ghdeck").join("excluded-teams"))
+    Some(base.join("ghdeck").join(name))
 }
 
 /// One `org/team` per line; a missing file means none.
@@ -31,13 +33,63 @@ pub fn load(path: &Path) -> io::Result<Vec<String>> {
     }
 }
 
-/// Replaces the file in one step, so a crash cannot leave half of it.
 pub fn save(path: &Path, teams: &[String]) -> io::Result<()> {
+    let text: String = teams.iter().map(|t| format!("{t}\n")).collect();
+    write(path, &text)
+}
+
+/// What was shown when the app was last used.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct View {
+    pub orgs: Vec<Choice>,
+    pub repos: Vec<Choice>,
+    /// Filters and states of every tab.
+    pub tabs: Vec<(Vec<Choice>, Vec<Choice>)>,
+    pub raw: bool,
+}
+
+impl View {
+    /// Drop what would not make a valid query.
+    fn checked(mut self) -> Self {
+        self.orgs.retain(|o| valid_repo(&format!("{}/x", o.1)));
+        self.repos.retain(|r| valid_repo(&r.1));
+        self.tabs.truncate(Tab::ALL.len());
+        for (tab, (filters, states)) in Tab::ALL.into_iter().zip(&mut self.tabs) {
+            let known = api::filters(tab, &[]);
+            let team = |value: &str| {
+                let team = value.strip_prefix("team-review-requested:");
+                tab == Tab::Prs && team.is_some_and(valid_repo)
+            };
+            filters.retain(|f| team(&f.1) || known.iter().any(|k| k.1 == f.1));
+            let known = api::states(tab);
+            states.retain(|s| known.contains(s));
+        }
+        self
+    }
+}
+
+/// `None` when nothing was saved yet.
+pub fn load_view(path: &Path) -> io::Result<Option<View>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let view: View = serde_json::from_str(&text)?;
+    Ok(Some(view.checked()))
+}
+
+pub fn save_view(path: &Path, view: &View) -> io::Result<()> {
+    write(path, &serde_json::to_string_pretty(view)?)
+}
+
+/// Replaces the file in one step, so a crash cannot leave half of it.
+fn write(path: &Path, text: &str) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
     let new = path.with_extension("new");
-    let text: String = teams.iter().map(|t| format!("{t}\n")).collect();
     fs::write(&new, text)?;
     fs::rename(&new, path)
 }
@@ -57,6 +109,34 @@ mod tests {
         assert_eq!(load(&path).unwrap(), teams);
         fs::write(&path, "o/a OR is:open\n").unwrap();
         assert!(load(&path).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn view_survives_and_is_checked() {
+        let choice = |v: &str| (v.to_string(), v.to_string());
+        let dir = env::temp_dir().join(format!("ghdeck-view-{}", std::process::id()));
+        let path = dir.join("view.json");
+        assert_eq!(load_view(&path).unwrap(), None);
+        let mut view = View {
+            orgs: vec![choice("o"), choice("a b OR is:open")],
+            repos: vec![choice("o/r"), choice("o/r is:closed")],
+            tabs: Tab::ALL
+                .map(|t| (api::default_filters(t), api::default_states(t)))
+                .to_vec(),
+            raw: true,
+        };
+        view.tabs[0].0.push(choice("team-review-requested:o/t"));
+        view.tabs[0].0.push(choice("is:evil"));
+        view.tabs[1].1.push(choice("is:evil"));
+        save_view(&path, &view).unwrap();
+        let got = load_view(&path).unwrap().unwrap();
+        assert_eq!((got.orgs.len(), got.repos.len()), (1, 1));
+        let kept = api::default_filters(Tab::Prs).len() + 1;
+        assert_eq!((got.tabs[0].0.len(), got.tabs[1].1.len()), (kept, 1));
+        assert!(got.raw);
+        fs::write(&path, "{").unwrap();
+        assert!(load_view(&path).is_err());
         fs::remove_dir_all(&dir).unwrap();
     }
 }

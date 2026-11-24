@@ -2,9 +2,10 @@
 
 use crate::api::{self, Choice, Item, Reviews};
 use crate::app::{App, Modal, Picker, Status};
-use crate::doc::{GUTTER, Kind as LineKind, clean};
+use crate::doc::{GUTTER, Kind as LineKind, Visible, clean};
 use crate::form::{Form, Kind, line_at};
 use crate::keys::{self, Act, Group, Key, SCOPE, Tab};
+use crate::markdown as md;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -579,9 +580,22 @@ fn draw_doc(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         ""
     };
+    let name = if app.raw && app.applies(Act::Raw) {
+        format!("{name} (raw)")
+    } else {
+        name.to_string()
+    };
     let mut block = pane(app.detail_focus && app.modal.is_none())
         .title(Line::styled(format!(" {name}{loading} "), BOLD));
-    block = block.title_bottom(if app.detail_focus {
+    let line_mode = app.detail_focus && app.doc.cursor.is_some();
+    block = block.title_bottom(if line_mode {
+        hints(&[
+            ("j/k", "Line"),
+            ("n/N", "File"),
+            ("u/U", "Discussion"),
+            ("Esc", "Leave line mode"),
+        ])
+    } else if app.detail_focus {
         hints(&[
             ("j/k", "Scroll"),
             ("Space", "Page"),
@@ -617,16 +631,23 @@ fn draw_doc(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(block, area);
     for (n, row) in app.doc.visible(height).enumerate() {
         let area = Rect::new(inner.x, inner.y + n as u16, inner.width, 1);
-        let (text, background) = doc_line(row.indent, row.text, row.kind);
+        let (text, background) = doc_line(&row);
         frame.render_widget(text, area);
         if let Some(color) = background {
             frame.buffer_mut().set_style(area, Style::new().bg(color));
+        }
+        if row.selected {
+            let style = Style::new().add_modifier(Modifier::REVERSED);
+            frame.buffer_mut().set_style(area, style);
         }
     }
 }
 
 /// Styled text and the background of the whole row.
-fn doc_line(indent: usize, text: &str, kind: LineKind) -> (Line<'_>, Option<Color>) {
+fn doc_line<'a>(row: &Visible<'a>) -> (Line<'a>, Option<Color>) {
+    // Only rendered Markdown has more than one part.
+    let (kind, indent) = (row.kind, row.indent);
+    let text = row.parts.first().map_or("", |p| p.0);
     let fg = |c| Style::new().fg(c);
     if kind.is_code() {
         let (code, background) = match kind {
@@ -651,20 +672,58 @@ fn doc_line(indent: usize, text: &str, kind: LineKind) -> (Line<'_>, Option<Colo
         };
         return (line, background);
     }
-    match kind {
-        LineKind::Title => (Line::styled(text, BOLD), None),
-        LineKind::Heading => (
-            Line::styled(text, fg(ACCENT).add_modifier(Modifier::BOLD)),
-            None,
-        ),
+    let (base, background) = match kind {
+        LineKind::Title => (BOLD, None),
+        LineKind::Heading => (fg(ACCENT).add_modifier(Modifier::BOLD), None),
         LineKind::File => (
-            Line::styled(text, fg(Color::Indexed(255)).add_modifier(Modifier::BOLD)),
+            fg(Color::Indexed(255)).add_modifier(Modifier::BOLD),
             Some(Color::Indexed(24)),
         ),
-        LineKind::Hunk => (Line::styled(text, fg(Color::Magenta)), None),
-        LineKind::Summary => (summary_line(text), None),
-        _ => (Line::raw(text), None),
+        LineKind::Hunk => (fg(Color::Magenta), None),
+        LineKind::Block => (fg(Color::Indexed(252)), Some(Color::Indexed(236))),
+        LineKind::Open => (
+            fg(Color::Indexed(220)).add_modifier(Modifier::BOLD),
+            Some(Color::Indexed(235)),
+        ),
+        LineKind::Done => (fg(Color::Indexed(114)), Some(Color::Indexed(235))),
+        LineKind::Note => (fg(Color::Indexed(252)), Some(Color::Indexed(235))),
+        LineKind::Summary if indent == 0 => return (summary_line(text), None),
+        _ => (Style::new(), None),
+    };
+    let mut margin = " ".repeat(indent);
+    if kind == LineKind::Note && indent > GUTTER {
+        margin = format!("{}┃{}", " ".repeat(GUTTER), " ".repeat(indent - GUTTER - 1));
     }
+    let mut spans = vec![Span::raw(margin)];
+    let parts = row.parts.iter();
+    spans.extend(parts.map(|(text, bits)| Span::styled(*text, base.patch(inline(*bits)))));
+    (Line::from(spans), background)
+}
+
+/// Style of rendered Markdown.
+fn inline(bits: u8) -> Style {
+    let mut style = Style::new();
+    for (bit, part) in [
+        (md::BOLD, BOLD),
+        (md::ITALIC, Style::new().add_modifier(Modifier::ITALIC)),
+        (md::STRIKE, Style::new().add_modifier(Modifier::CROSSED_OUT)),
+        (
+            md::LINK,
+            Style::new()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::UNDERLINED),
+        ),
+        (
+            md::CODE,
+            Style::new().fg(Color::Indexed(222)).bg(Color::Indexed(236)),
+        ),
+        (md::DIM, DIM),
+    ] {
+        if bits & bit != 0 {
+            style = style.patch(part);
+        }
+    }
+    style
 }
 
 /// ` M    +12     -3  path`, as written by `Doc`.
@@ -706,6 +765,7 @@ fn action(app: &App, name: &str, k: &Key, color: Color) -> [Span<'static>; 2] {
     let label = match (k.act, app.list().selected().map(Item::state)) {
         (Act::Toggle, Some("open" | "draft")) => "Close",
         (Act::Toggle, Some("closed")) => "Reopen",
+        (Act::Raw, _) if app.raw => "Rendered",
         _ => k.label,
     };
     let count = match (k.act, app.excluded.len()) {
@@ -727,6 +787,29 @@ fn action(app: &App, name: &str, k: &Key, color: Color) -> [Span<'static>; 2] {
 
 /// What is useful right now, as far as it fits; the popup has the rest.
 fn footer_line(app: &App, width: usize) -> Line<'static> {
+    if app.detail_focus && app.doc.cursor.is_some() {
+        let keys: &[(&str, &str)] = match (app.doc.thread_at_cursor(), app.doc.anchor) {
+            (Some(_), _) => &[
+                ("Enter", "Reply"),
+                ("x", "Resolve/Reopen"),
+                ("O", "Resolved"),
+            ],
+            (None, None) => &[
+                ("Enter", "Comment"),
+                ("Space", "Start range"),
+                ("z", "Zoom"),
+            ],
+            (None, Some(_)) => &[("Enter", "Comment on range"), ("Space", "Drop range")],
+        };
+        let mut line = hints(keys);
+        let badge = Style::new().fg(Color::Black).bg(Color::Yellow);
+        line.spans.insert(
+            0,
+            Span::styled(" LINE MODE ", badge.add_modifier(Modifier::BOLD)),
+        );
+        line.spans.extend(hints(&[("Esc", "Leave")]).spans);
+        return line;
+    }
     let find = |act: Act| {
         keys::all(app.tab).find_map(|g| {
             let (name, k) = g.shown().find(|(_, k)| k.act == act)?;
@@ -879,7 +962,9 @@ fn draw_help(frame: &mut Frame, tab: Tab) {
         }
     }
     if tab == Tab::Prs {
-        lines.push(Line::raw(""));
+        lines.push(Line::raw(
+            " LINE MODE  l start, Space range, Enter comment or reply, x resolve",
+        ));
         let columns = " COLUMNS  S state: Open, Draft, Merged, Closed   C checks   A approval";
         lines.push(Line::raw(columns));
         let marks = [
@@ -985,7 +1070,23 @@ fn draw_form(frame: &mut Frame, form: &Form) {
         Act::Description => (120, 40),
         _ => (84, wanted),
     };
-    let inner = popup(frame, width, wanted + 3, block);
+    let notes = form.notes.len() as u16;
+    let mut inner = popup(frame, width, wanted + notes + 3, block);
+    for (good, text) in &form.notes {
+        let (mark, color) = if *good {
+            ("✓", Color::Green)
+        } else {
+            ("✗", Color::Red)
+        };
+        let row = Rect {
+            height: 1.min(inner.height),
+            ..inner
+        };
+        let text = fit(&format!(" {mark} {text}"), row.width as usize);
+        frame.render_widget(Line::styled(text, Style::new().fg(color)), row);
+        inner.y += row.height;
+        inner.height -= row.height;
+    }
     let areas = Layout::vertical(heights).split(inner);
     for (i, field) in form.fields.iter().enumerate() {
         let (area, focused) = (areas[i], i == form.focus);

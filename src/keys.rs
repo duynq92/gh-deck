@@ -51,6 +51,14 @@ pub enum Act {
     More,
     Refresh,
     Zoom,
+    Raw,
+    Lines,
+    NextThread,
+    PrevThread,
+    Resolved,
+    // Only in line mode
+    LineComment,
+    Reply,
     Menu,
     Help,
     Message,
@@ -153,10 +161,11 @@ const PRS: &[Group] = &[
         keys: &[
             k('i', "Info", Act::Info),
             k('d', "Diff", Act::Diff),
-            k('n', "Next/prev file", Act::NextFile),
+            k('n', "Files", Act::NextFile),
             k('N', "", Act::PrevFile),
             k('h', "Checks", Act::Checks),
             k('w', "Web", Act::Web),
+            k('M', "Raw text", Act::Raw),
         ],
     },
     Group {
@@ -165,6 +174,15 @@ const PRS: &[Group] = &[
             k('a', "Approve", Act::Approve),
             k('x', "Request changes", Act::RequestChanges),
             k('c', "Comment", Act::Comment),
+        ],
+    },
+    Group {
+        name: "Code",
+        keys: &[
+            k('l', "Line comment", Act::Lines),
+            k('u', "Discussions", Act::NextThread),
+            k('U', "", Act::PrevThread),
+            k('O', "Resolved", Act::Resolved),
         ],
     },
     Group {
@@ -194,7 +212,11 @@ const PRS: &[Group] = &[
 const ISSUES: &[Group] = &[
     Group {
         name: "View",
-        keys: &[k('i', "Info", Act::Info), k('w', "Web", Act::Web)],
+        keys: &[
+            k('i', "Info", Act::Info),
+            k('w', "Web", Act::Web),
+            k('M', "Raw text", Act::Raw),
+        ],
     },
     Group {
         name: "Edit",
@@ -217,6 +239,7 @@ const RELEASES: &[Group] = &[
         keys: &[
             k('i', "Info", Act::Info),
             k('w', "Web", Act::Web),
+            k('M', "Raw text", Act::Raw),
             k('D', "Download", Act::Download),
         ],
     },
@@ -279,6 +302,8 @@ pub fn footer(tab: Tab, reading: bool) -> &'static [Act] {
     match (tab, reading) {
         (Tab::Prs, true) => &[
             NextFile,
+            Lines,
+            NextThread,
             Zoom,
             Approve,
             RequestChanges,
@@ -287,6 +312,8 @@ pub fn footer(tab: Tab, reading: bool) -> &'static [Act] {
             Merge,
             Diff,
             Info,
+            Raw,
+            Resolved,
             Checks,
             Description,
             Tasks,
@@ -310,7 +337,7 @@ pub fn footer(tab: Tab, reading: bool) -> &'static [Act] {
             Web,
         ],
         (Tab::Issues, _) => &[
-            Comment, New, Labels, Assignees, Toggle, Find, Zoom, Web, More, Refresh,
+            Comment, New, Labels, Assignees, Toggle, Find, Zoom, Raw, Web, More, Refresh,
         ],
         (Tab::Releases, _) => &[
             New, Edit, Publish, Download, Delete, Find, Zoom, Web, Refresh,

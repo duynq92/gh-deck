@@ -1,9 +1,11 @@
 //! GitHub data: list queries, detail documents and mutating commands.
 //! `--jq` trims responses inside `gh`, so only displayed fields reach us.
 
+use crate::doc::Source;
 use crate::form::Form;
 use crate::gh::{self, Cmd, GhError, Guard, Keep, Result};
 use crate::keys::{Act, Tab};
+use crate::review::{self, split};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use std::thread;
@@ -210,6 +212,14 @@ impl Item {
             )
             .to_lowercase()
             .contains(needle)
+    }
+
+    /// Preview as a document.
+    pub fn source(&self) -> Source {
+        match self {
+            Item::Run(_) => Source::plain(self.preview()),
+            _ => Source::preview(&self.preview()),
+        }
     }
 
     /// Instant preview, built from data the list already holds.
@@ -667,11 +677,6 @@ fn share(n: usize) -> usize {
     (2 * PAGE / n.max(1)).clamp(10, PAGE)
 }
 
-fn split(repo: &str) -> Result<(&str, &str)> {
-    repo.split_once('/')
-        .ok_or_else(|| GhError(format!("invalid repository {repo:?}")))
-}
-
 fn repo_runs(repo: &str, status: &str, count: usize) -> Result<Vec<Run>> {
     let status = match status {
         "" => String::new(),
@@ -760,52 +765,65 @@ pub fn workflows(repo: &str) -> Result<Vec<(String, String)>> {
         .collect())
 }
 
-/// A loaded detail document.
-#[derive(Debug, Default)]
-pub struct Detail {
-    pub head: String,
-    pub body: String,
-    pub tail: String,
-    pub diff: Option<String>,
+/// Load a detail document.
+pub fn detail(act: Act, item: &Item) -> Result<Source> {
+    match (act, item) {
+        (Act::Diff | Act::Info, Item::Ticket(t)) if !t.head.is_empty() => pull(act, item, t),
+        // Job lists and logs are not Markdown.
+        (Act::Info, Item::Ticket(_) | Item::Release(_)) => Ok(Source::preview(&text(act, item)?)),
+        _ => Ok(Source::plain(text(act, item)?)),
+    }
 }
 
-/// Load a detail document.
-pub fn detail(act: Act, item: &Item) -> Result<Detail> {
-    let is_pr = matches!(item, Item::Ticket(t) if !t.head.is_empty());
-    match act {
-        Act::Diff => Ok(Detail {
-            diff: Some(text(act, item)?),
-            ..Detail::default()
-        }),
-        Act::Info if is_pr => {
-            let (talk, diff) = thread::scope(|s| {
-                let diff = s.spawn(|| text(Act::Diff, item));
-                let talk = text(act, item);
-                let diff = diff
-                    .join()
-                    .unwrap_or_else(|_| Err(GhError("worker panicked".into())));
-                (talk, diff)
-            });
-            let tail = format!("── Conversation\n{}", talk?);
+/// A pull request: its changes and discussions, and for Info its description
+/// and conversation.
+fn pull(act: Act, item: &Item, t: &Ticket) -> Result<Source> {
+    let (diff, talk, comments) = thread::scope(|s| {
+        let diff = s.spawn(|| text(Act::Diff, item));
+        let talk = s.spawn(|| review::load(&t.repo, t.number));
+        let comments = (act == Act::Info).then(|| text(act, item));
+        let lost = || Err(GhError("worker panicked".into()));
+        (
+            diff.join().unwrap_or_else(|_| lost()),
+            talk.join()
+                .unwrap_or_else(|_| Err(GhError("worker panicked".into()))),
+            comments,
+        )
+    });
+    let mut source = Source {
+        markdown: true,
+        ..Source::default()
+    };
+    // What failed is said; the rest is still useful.
+    let mut missing = String::new();
+    let talk = match talk {
+        Ok(talk) => talk,
+        Err(e) => {
+            missing += &format!("── Discussions not available: {e}\n\n");
+            review::Talk::default()
+        }
+    };
+    match comments {
+        Some(comments) => {
+            source.tail = format!("── Conversation\n{}", comments?);
             let preview = item.preview();
             let (head, body) = preview.split_once("\n\n").unwrap_or((&preview, ""));
-            let mut body = format!("── Description\n{body}");
-            // GitHub refuses very large diffs; the rest is still useful.
-            let diff = diff
-                .map_err(|e| body = format!("── Changes not available: {e}\n\n{body}"))
-                .ok();
-            Ok(Detail {
-                head: head.to_string(),
-                body,
-                tail,
-                diff,
-            })
+            source.head = format!("{head}\n{}", talk.summary());
+            match diff {
+                Ok(diff) => source.diff = Some(diff),
+                // GitHub refuses very large diffs.
+                Err(e) => missing += &format!("── Changes not available: {e}\n\n"),
+            }
+            source.body = format!("{missing}── Description\n{body}");
         }
-        _ => Ok(Detail {
-            head: text(act, item)?,
-            ..Detail::default()
-        }),
+        None => {
+            source.diff = Some(diff?);
+            source.body = missing;
+        }
     }
+    source.threads = talk.threads;
+    source.oid = talk.oid;
+    Ok(source)
 }
 
 fn text(act: Act, item: &Item) -> Result<String> {
@@ -1043,6 +1061,148 @@ pub fn edit_body(repo: &str, number: u64, old: &str, new: String) -> Cmd {
         ]),
         stdin: Some(new),
         guard: Some(text_guard(repo, number, "body", old)),
+        ..Cmd::default()
+    }
+}
+
+/// What to know before merging.
+#[derive(Debug, Default)]
+pub struct Readiness {
+    pub oid: String,
+    pub conflicts: bool,
+    /// Allowed methods, the preferred one first.
+    pub methods: Vec<&'static str>,
+    /// Good and bad news.
+    pub notes: Vec<(bool, String)>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MergeFacts {
+    oid: String,
+    mergeable: String,
+    state: String,
+    decision: Option<String>,
+    /// Name and state of every check.
+    checks: Vec<(String, String)>,
+    unresolved: usize,
+    merge: bool,
+    squash: bool,
+    rebase: bool,
+    preferred: String,
+    deletes: bool,
+}
+
+pub fn readiness(repo: &str, number: u64) -> Result<Readiness> {
+    let (owner, name) = split(repo)?;
+    let facts: MergeFacts = fetch(&[
+        "api",
+        "graphql",
+        "-f",
+        "query=query($o:String!,$n:String!,$number:Int!){repository(owner:$o,name:$n){\
+         mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed viewerDefaultMergeMethod \
+         deleteBranchOnMerge pullRequest(number:$number){headRefOid mergeable mergeStateStatus \
+         reviewDecision reviewThreads(first:100){nodes{isResolved}} \
+         commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{\
+         ...on CheckRun{name conclusion status} ...on StatusContext{context state}}}}}}}}}}",
+        "-f",
+        &format!("o={owner}"),
+        "-f",
+        &format!("n={name}"),
+        "-F",
+        &format!("number={number}"),
+        "--jq",
+        ".data.repository|.pullRequest as $p|{oid:$p.headRefOid,mergeable:$p.mergeable,\
+         state:$p.mergeStateStatus,decision:$p.reviewDecision,\
+         checks:[$p.commits.nodes[0].commit.statusCheckRollup.contexts.nodes[]?\
+         |[(.name//.context//\"\"),(.conclusion//.state//.status//\"\")]],\
+         unresolved:([$p.reviewThreads.nodes[]|select(.isResolved|not)]|length),\
+         merge:.mergeCommitAllowed,squash:.squashMergeAllowed,rebase:.rebaseMergeAllowed,\
+         preferred:.viewerDefaultMergeMethod,deletes:.deleteBranchOnMerge}",
+    ])?;
+    Ok(judge(facts))
+}
+
+fn judge(f: MergeFacts) -> Readiness {
+    let mut methods = Vec::new();
+    for (allowed, id, name) in [
+        (f.merge, "MERGE", "Merge commit"),
+        (f.squash, "SQUASH", "Squash"),
+        (f.rebase, "REBASE", "Rebase"),
+    ] {
+        if allowed {
+            let at = if f.preferred == id { 0 } else { methods.len() };
+            methods.insert(at, name);
+        }
+    }
+    let mut notes = Vec::new();
+    let mut note = |good: bool, text: String| notes.push((good, text));
+    match f.mergeable.as_str() {
+        "MERGEABLE" => note(true, "no conflicts".into()),
+        "CONFLICTING" => note(false, "conflicts with the base branch".into()),
+        _ => note(false, "GitHub is still checking for conflicts".into()),
+    }
+    match f.decision.as_deref() {
+        Some("APPROVED") => note(true, "approved".into()),
+        Some("CHANGES_REQUESTED") => note(false, "changes requested".into()),
+        Some(_) => note(false, "approval is still required".into()),
+        None => {}
+    }
+    let named = |wanted: &[&str]| -> Vec<&str> {
+        let checks = f.checks.iter().filter(|c| wanted.contains(&c.1.as_str()));
+        checks.map(|c| c.0.as_str()).collect()
+    };
+    let failed = named(&[
+        "FAILURE",
+        "ERROR",
+        "TIMED_OUT",
+        "CANCELLED",
+        "ACTION_REQUIRED",
+        "STARTUP_FAILURE",
+        "STALE",
+    ]);
+    let running = named(&[
+        "QUEUED",
+        "IN_PROGRESS",
+        "PENDING",
+        "WAITING",
+        "REQUESTED",
+        "EXPECTED",
+    ]);
+    let list = |names: &[&str]| {
+        let more = names.len().saturating_sub(3);
+        let first = names.iter().take(3).copied().collect::<Vec<_>>().join(", ");
+        if more > 0 {
+            format!("{first} +{more}")
+        } else {
+            first
+        }
+    };
+    if !failed.is_empty() {
+        note(false, format!("checks failed: {}", list(&failed)));
+    }
+    if !running.is_empty() {
+        note(false, format!("checks running: {}", list(&running)));
+    }
+    if failed.is_empty() && running.is_empty() && !f.checks.is_empty() {
+        note(true, format!("all {} checks passed", f.checks.len()));
+    }
+    match f.unresolved {
+        0 => {}
+        n => note(false, format!("{n} unresolved discussions")),
+    }
+    match f.state.as_str() {
+        "BLOCKED" => note(false, "blocked by the branch rules".into()),
+        "BEHIND" => note(false, "behind the base branch".into()),
+        _ => {}
+    }
+    if f.deletes {
+        note(true, "the branch is deleted automatically".into());
+    }
+    Readiness {
+        oid: f.oid,
+        conflicts: f.mergeable == "CONFLICTING",
+        methods,
+        notes,
     }
 }
 
@@ -1168,8 +1328,7 @@ pub fn request_reviews(repo: &str, number: u64, old: &[String], new: &[String]) 
     (!what.is_empty()).then(|| Cmd {
         label: format!("{repo}#{number}: {}", what.join("; ")),
         args: list,
-        stdin: None,
-        guard: None,
+        ..Cmd::default()
     })
 }
 
@@ -1230,8 +1389,7 @@ pub fn simple(act: Act, item: &Item) -> Option<Cmd> {
     Some(Cmd {
         label: format!("{verb} {}", item.id()),
         args: list,
-        stdin: None,
-        guard: None,
+        ..Cmd::default()
     })
 }
 
@@ -1260,6 +1418,14 @@ pub fn submit(form: &Form) -> std::result::Result<Cmd, String> {
             let kind = if t.head.is_empty() { "issue" } else { "pr" };
             args(&[kind, "comment", &number, &repo, "--body-file=-"])
         }
+        (Act::LineComment, Some(Item::Ticket(t))) => {
+            need(0)?;
+            return review::comment(&t.repo, t.number, &form.extra, text(0));
+        }
+        (Act::Reply, Some(Item::Ticket(t))) => {
+            need(0)?;
+            return review::reply(&t.repo, t.number, &form.extra, text(0));
+        }
         (Act::Approve, Some(Item::Ticket(_))) => {
             let mut a = args(&["pr", "review", &number, &repo, "--approve"]);
             if !text(0).trim().is_empty() {
@@ -1281,7 +1447,12 @@ pub fn submit(form: &Form) -> std::result::Result<Cmd, String> {
             ])
         }
         (Act::Merge, Some(Item::Ticket(t))) => {
-            let method = ["--merge", "--squash", "--rebase"][form.choice(0)];
+            let method = match form.chosen(0) {
+                "Merge commit" => "--merge",
+                "Squash" => "--squash",
+                "Rebase" => "--rebase",
+                other => return Err(format!("unknown method {other:?}")),
+            };
             // Refuse to merge commits pushed after the list was loaded.
             let head = format!("--match-head-commit={}", t.oid);
             let mut a = args(&["pr", "merge", &number, &repo, method, &head]);
@@ -1381,6 +1552,7 @@ pub fn submit(form: &Form) -> std::result::Result<Cmd, String> {
         args: list,
         stdin,
         guard,
+        ..Cmd::default()
     })
 }
 
@@ -1645,5 +1817,46 @@ mod tests {
         let cmd = submit(&form).unwrap();
         assert_eq!(cmd.stdin.as_deref(), Some("a\nc"));
         assert_eq!(cmd.guard.unwrap().expected, "a\r\nb");
+    }
+
+    #[test]
+    fn merge_readiness_names_problems_and_methods() {
+        let ready = judge(MergeFacts {
+            mergeable: "MERGEABLE".into(),
+            state: "BLOCKED".into(),
+            decision: Some("REVIEW_REQUIRED".into()),
+            checks: [
+                ("a", "SUCCESS"),
+                ("b", "FAILURE"),
+                ("c", "QUEUED"),
+                ("d", "SKIPPED"),
+            ]
+            .map(|(n, s)| choice(n, s))
+            .to_vec(),
+            unresolved: 2,
+            merge: true,
+            squash: true,
+            preferred: "SQUASH".into(),
+            ..MergeFacts::default()
+        });
+        assert_eq!(ready.methods, ["Squash", "Merge commit"]);
+        let notes: Vec<_> = ready.notes.iter().map(|n| (n.0, n.1.as_str())).collect();
+        assert_eq!(
+            notes,
+            [
+                (true, "no conflicts"),
+                (false, "approval is still required"),
+                (false, "checks failed: b"),
+                (false, "checks running: c"),
+                (false, "2 unresolved discussions"),
+                (false, "blocked by the branch rules"),
+            ]
+        );
+        assert!(!ready.conflicts);
+        let bad = judge(MergeFacts {
+            mergeable: "CONFLICTING".into(),
+            ..MergeFacts::default()
+        });
+        assert!(bad.conflicts && bad.methods.is_empty());
     }
 }

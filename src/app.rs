@@ -1,11 +1,13 @@
 //! Application state and key handling.
 
-use crate::api::{self, Candidates, Choice, Detail, Item, Page, PrText, Query, Repos, Reviews};
+use crate::api::Readiness;
+use crate::api::{self, Candidates, Choice, Item, Page, PrText, Query, Repos, Reviews};
 use crate::config;
-use crate::doc::Doc;
+use crate::doc::{Doc, Mark, Source};
 use crate::form::{self, Form};
 use crate::gh::{self, Cmd, GhError, Result};
 use crate::keys::{self, Act, Tab};
+use crate::review;
 use crate::tasks;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::path::PathBuf;
@@ -27,7 +29,9 @@ pub enum Msg {
     Doc {
         job: u64,
         bottom: bool,
-        result: Result<Detail>,
+        /// Loaded again: stay at the same place.
+        refresh: bool,
+        result: Result<Source>,
     },
     Workflows {
         job: u64,
@@ -46,8 +50,14 @@ pub enum Msg {
         item: Box<Item>,
         result: Result<PrText>,
     },
+    Merge {
+        job: u64,
+        item: Box<Item>,
+        result: Result<Readiness>,
+    },
     Done {
         tab: Tab,
+        reload: bool,
         label: String,
         form: Option<Box<Form>>,
         result: Result<String>,
@@ -223,12 +233,21 @@ pub struct App {
     pub excluded: Vec<String>,
     /// Where `excluded` is saved; `None` until it was read without trouble.
     config: Option<PathBuf>,
+    /// Where the view is saved; `None` until it was read without trouble.
+    view_path: Option<PathBuf>,
+    saved: config::View,
+    /// A repository was given on the command line: do not save it.
+    fixed: bool,
     pub modal: Option<Modal>,
     pub finding: bool,
     pub detail_focus: bool,
     /// The focused document fills the screen.
     pub zoom: bool,
     pub doc: Doc,
+    /// What `doc` was made of, to switch between rendered and raw.
+    source: Source,
+    /// Show Markdown as it was written.
+    pub raw: bool,
     pub doc_act: Act,
     /// Item the document belongs to.
     doc_id: String,
@@ -247,6 +266,7 @@ pub struct App {
 
 impl App {
     pub fn new(tx: Sender<Msg>, scope: Option<String>) -> Self {
+        let fixed = scope.is_some();
         App {
             tx,
             tab: Tab::Prs,
@@ -261,11 +281,16 @@ impl App {
             teams_ready: false,
             excluded: Vec::new(),
             config: None,
+            view_path: None,
+            saved: config::View::default(),
+            fixed,
             modal: None,
             finding: false,
             detail_focus: false,
             zoom: false,
             doc: Doc::default(),
+            source: Source::default(),
+            raw: false,
             doc_act: Act::Info,
             doc_id: String::new(),
             doc_loading: false,
@@ -281,15 +306,56 @@ impl App {
     }
 
     fn load_config(&mut self) {
-        let Some(path) = config::path() else {
+        let (Some(teams), Some(view)) = (config::path("excluded-teams"), config::path("view.json"))
+        else {
             return self.error("cannot find a config directory: HOME is not set");
         };
-        match config::load(&path) {
-            Ok(teams) => {
-                self.excluded = teams;
-                self.config = Some(path);
+        match config::load(&teams) {
+            Ok(list) => {
+                self.excluded = list;
+                self.config = Some(teams);
             }
-            Err(e) => self.error(format!("{}: {e}", path.display())),
+            Err(e) => self.error(format!("{}: {e}", teams.display())),
+        }
+        match config::load_view(&view) {
+            Ok(saved) => {
+                if let Some(saved) = saved {
+                    self.restore(saved);
+                }
+                self.view_path = Some(view);
+            }
+            Err(e) => self.error(format!("{}: {e}", view.display())),
+        }
+    }
+
+    fn restore(&mut self, view: config::View) {
+        self.raw = view.raw;
+        if !self.fixed {
+            self.orgs = view.orgs.clone();
+            self.scope = view.repos.clone();
+        }
+        for (list, (filters, states)) in self.lists.iter_mut().zip(&view.tabs) {
+            list.filters = filters.clone();
+            list.states = states.clone();
+        }
+        self.saved = view;
+    }
+
+    /// Remember what is shown for the next start.
+    fn save_view(&mut self) {
+        let Some(path) = &self.view_path else { return };
+        if !self.fixed {
+            self.saved.orgs = self.orgs.clone();
+            self.saved.repos = self.scope.clone();
+        }
+        let tabs = self.lists.iter();
+        self.saved.tabs = tabs
+            .map(|l| (l.filters.clone(), l.states.clone()))
+            .collect();
+        self.saved.raw = self.raw;
+        if let Err(e) = config::save_view(path, &self.saved) {
+            let text = format!("{}: {e}", path.display());
+            self.error(text);
         }
     }
 
@@ -394,14 +460,29 @@ impl App {
         } else if self.detail_focus || self.doc_loading {
             return;
         }
-        let text = self
-            .list()
-            .selected()
-            .map(Item::preview)
-            .unwrap_or_default();
-        self.doc = Doc::plain(&text);
+        let source = self.list().selected().map(Item::source);
+        self.show(source.unwrap_or_default());
         self.doc_act = Act::Info;
         self.doc_id = id;
+    }
+
+    fn show(&mut self, source: Source) {
+        self.doc = Doc::new(&source, self.raw);
+        self.source = source;
+    }
+
+    /// Switch between rendered and raw, staying at the same file.
+    fn toggle_raw(&mut self) {
+        self.raw = !self.raw;
+        self.save_view();
+        let file = self.doc.current_file().map(|f| f.0);
+        let width = self.doc.width();
+        self.doc = Doc::new(&self.source, self.raw);
+        if let Some(n) = file {
+            self.doc.layout(width);
+            let height = self.doc_height;
+            self.doc.show_file(n, height);
+        }
     }
 
     fn open_doc(&mut self, act: Act) {
@@ -412,16 +493,32 @@ impl App {
         self.doc_loading = true;
         self.doc_act = act;
         self.detail_focus = true;
-        let text = if act == Act::Info {
-            item.preview()
+        self.show(if act == Act::Info {
+            item.source()
         } else {
-            String::new()
-        };
-        self.doc = Doc::plain(&text);
+            Source::default()
+        });
         let job = self.doc_job;
         self.spawn(move || Msg::Doc {
             job,
             bottom: matches!(act, Act::Log | Act::FailedLog),
+            refresh: false,
+            result: api::detail(act, &item),
+        });
+    }
+
+    /// Load the open document again without losing the place.
+    fn refresh_doc(&mut self) {
+        let Some(item) = self.list().selected().cloned() else {
+            return;
+        };
+        self.doc_job += 1;
+        self.doc_loading = true;
+        let (job, act) = (self.doc_job, self.doc_act);
+        self.spawn(move || Msg::Doc {
+            job,
+            bottom: false,
+            refresh: true,
             result: api::detail(act, &item),
         });
     }
@@ -439,6 +536,7 @@ impl App {
         let tab = self.tab;
         self.spawn(move || Msg::Done {
             tab,
+            reload: cmd.reload,
             result: gh::execute(&cmd),
             label: cmd.label,
             form,
@@ -502,16 +600,33 @@ impl App {
             Msg::Doc {
                 job,
                 bottom,
+                refresh,
                 result,
             } if job == self.doc_job => {
                 self.doc_loading = false;
                 match result {
-                    Ok(d) => {
+                    Ok(mut d) => {
                         let top = self.doc.top;
-                        self.doc = Doc::new(&d.head, &d.body, d.diff.as_deref(), &d.tail);
+                        d.show_resolved = self.source.show_resolved;
+                        // Line mode goes on: its keys mean something else outside.
+                        let mark = self.doc.mark().map(|mark| match mark {
+                            Mark::Thread(n) => {
+                                let id = &self.source.threads[n].id;
+                                let now = d.threads.iter().position(|t| &t.id == id);
+                                Mark::Thread(now.unwrap_or(usize::MAX))
+                            }
+                            line => line,
+                        });
+                        let (width, height) = (self.doc.width(), self.doc_height);
+                        self.show(d);
                         // Logs are read from the end; rendering clamps this.
                         self.doc.top = if bottom { usize::MAX } else { top };
+                        if let Some(mark) = mark {
+                            self.doc.layout(width);
+                            self.doc.seek(&mark, height);
+                        }
                     }
+                    Err(e) if refresh => self.error(e),
                     Err(e) => {
                         self.doc_act = Act::Info;
                         self.detail_focus = false;
@@ -573,9 +688,25 @@ impl App {
                     Err(e) => self.error(e),
                 }
             }
-            Msg::Doc { .. } | Msg::Workflows { .. } | Msg::Reviewers { .. } | Msg::Text { .. } => {}
+            Msg::Merge { job, item, result } if job == self.pick_job => {
+                self.busy = None;
+                match result {
+                    Ok(ready) if self.modal.is_none() => {
+                        self.finding = false;
+                        self.merge_form(*item, ready);
+                    }
+                    Ok(_) => {}
+                    Err(e) => self.error(e),
+                }
+            }
+            Msg::Merge { .. }
+            | Msg::Doc { .. }
+            | Msg::Workflows { .. }
+            | Msg::Reviewers { .. }
+            | Msg::Text { .. } => {}
             Msg::Done {
                 tab,
+                reload,
                 label,
                 form,
                 result,
@@ -586,6 +717,9 @@ impl App {
                         let last = out.trim().lines().last().unwrap_or("").to_string();
                         self.info(format!("✓ {label} {last}"));
                         self.load(tab, false);
+                        if reload && self.detail_focus && tab == self.tab {
+                            self.refresh_doc();
+                        }
                     }
                     Err(e) => {
                         self.error(format!("{label}: {e}"));
@@ -717,6 +851,9 @@ impl App {
         if let Some(Status::Info(text) | Status::Error(text)) = self.status.take() {
             self.last_message = Some(text);
         }
+        if self.detail_focus && self.doc.cursor.is_some() && !ctrl {
+            return self.line_key(key);
+        }
         match key.code {
             KeyCode::Char('d') if ctrl => self.step(self.page() / 2),
             KeyCode::Char('u') if ctrl => self.step(-self.page() / 2),
@@ -815,6 +952,11 @@ impl App {
         match act {
             Act::Quit => self.quit = true,
             Act::Help => self.modal = Some(Modal::Help),
+            Act::Raw => self.toggle_raw(),
+            Act::Lines => self.start_lines(),
+            Act::NextThread => self.jump_thread(true),
+            Act::PrevThread => self.jump_thread(false),
+            Act::Resolved => self.toggle_resolved(),
             Act::Menu => self.modal = Some(Modal::Menu(0)),
             Act::Zoom => {
                 self.zoom = !self.zoom;
@@ -875,7 +1017,7 @@ impl App {
                 }
                 self.load(self.tab, false);
                 if self.detail_focus {
-                    self.open_doc(self.doc_act);
+                    self.refresh_doc();
                 }
             }
             Act::Info | Act::Diff | Act::Checks | Act::Log | Act::FailedLog => self.open_doc(act),
@@ -908,6 +1050,7 @@ impl App {
                 let tab = self.tab;
                 self.spawn(move || Msg::Done {
                     tab,
+                    reload: false,
                     label,
                     form: None,
                     result: api::checkout(&item).map(|_| String::new()),
@@ -963,6 +1106,21 @@ impl App {
             Act::Merge if item.state() != "open" => {
                 self.error(format!("cannot merge a {} pull request", item.state()));
             }
+            Act::Merge => {
+                let Item::Ticket(t) = &item else { return };
+                if let Some(busy) = &self.busy {
+                    self.status = Some(Status::Error(format!("still running: {busy}")));
+                    return;
+                }
+                self.busy = Some(format!("Checking {}", item.id()));
+                self.pick_job += 1;
+                let (job, repo, number) = (self.pick_job, t.repo.clone(), t.number);
+                self.spawn(move || Msg::Merge {
+                    job,
+                    item: Box::new(item),
+                    result: api::readiness(&repo, number),
+                });
+            }
             _ => {
                 if let Some(form) = Form::new(self.tab, act, item.repo(), Some(item.clone()), "") {
                     self.modal = Some(Modal::Form(Box::new(form)));
@@ -1002,6 +1160,160 @@ impl App {
             (Item::Ticket(t), Some(r)) => t.author.as_ref() == Some(&r.login),
             (Item::Ticket(_), None) => true,
             _ => false,
+        }
+    }
+
+    fn merge_form(&mut self, item: Item, ready: Readiness) {
+        let Item::Ticket(t) = &item else { return };
+        let id = item.id();
+        if t.oid != ready.oid {
+            return self.error(format!(
+                "{id} has new commits; press R and review them first"
+            ));
+        }
+        if ready.conflicts {
+            return self.error(format!("{id} has conflicts with its base branch"));
+        }
+        if ready.methods.is_empty() {
+            return self.error(format!("{} allows no merge method", t.repo));
+        }
+        let repo = t.repo.clone();
+        if let Some(mut form) = Form::new(Tab::Prs, Act::Merge, &repo, Some(item), "") {
+            form.fields[0].kind = form::Kind::Choice(ready.methods, 0);
+            form.notes = ready.notes;
+            self.modal = Some(Modal::Form(Box::new(form)));
+        }
+    }
+
+    /// Start line mode, or say why not.
+    fn start_lines(&mut self) {
+        if !self.doc.has_files() {
+            if self.doc_loading {
+                return self.info("still loading");
+            }
+            self.open_doc(Act::Diff);
+            return self.info("press l again when the changes are loaded");
+        }
+        self.detail_focus = true;
+        let height = self.doc_height;
+        if !self.doc.start_cursor(height) {
+            self.error("there is no line to comment on");
+        }
+    }
+
+    fn jump_thread(&mut self, forward: bool) {
+        if !self.doc.has_files() && !self.doc.has_threads() {
+            if !self.doc_loading {
+                self.open_doc(Act::Diff);
+            }
+            return self.info("press u again when the changes are loaded");
+        }
+        self.detail_focus = true;
+        let height = self.doc_height;
+        if !self.doc.jump_thread(forward, height) {
+            self.info("no discussions on the code");
+        }
+    }
+
+    fn toggle_resolved(&mut self) {
+        self.source.show_resolved = !self.source.show_resolved;
+        let (mark, top) = (self.doc.mark(), self.doc.top);
+        let (width, height) = (self.doc.width(), self.doc_height);
+        self.doc = Doc::new(&self.source, self.raw);
+        self.doc.top = top;
+        if let Some(mark) = mark {
+            self.doc.layout(width);
+            self.doc.seek(&mark, height);
+        }
+    }
+
+    /// Keys of line mode. Everything else waits until it is left.
+    fn line_key(&mut self, key: KeyEvent) {
+        let height = self.doc_height;
+        let page = height.max(2) as isize / 2;
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => self.doc.move_cursor(1, height),
+            KeyCode::Char('k') | KeyCode::Up => self.doc.move_cursor(-1, height),
+            KeyCode::PageDown => self.doc.move_cursor(page, height),
+            KeyCode::PageUp => self.doc.move_cursor(-page, height),
+            KeyCode::Char('g') | KeyCode::Home => self.doc.move_cursor(isize::MIN + 1, height),
+            KeyCode::Char('G') | KeyCode::End => self.doc.move_cursor(isize::MAX, height),
+            KeyCode::Char(c @ ('n' | 'N')) => {
+                self.doc.jump(c == 'n', height);
+                self.doc.start_cursor(height);
+            }
+            KeyCode::Char('u') => self.jump_thread(true),
+            KeyCode::Char('U') => self.jump_thread(false),
+            KeyCode::Char('O') => self.toggle_resolved(),
+            KeyCode::Char('z') => self.zoom = !self.zoom,
+            KeyCode::Char('?') => self.modal = Some(Modal::Help),
+            KeyCode::Char('!') => self.act(Act::Message),
+            KeyCode::Char(' ') | KeyCode::Char('v') => {
+                self.doc.anchor = match self.doc.anchor {
+                    Some(_) => None,
+                    None => self.doc.cursor,
+                };
+            }
+            KeyCode::Char('x') => self.toggle_thread(),
+            KeyCode::Enter | KeyCode::Char('c') => self.write_here(),
+            KeyCode::Esc | KeyCode::Char('l') => {
+                self.doc.cursor = None;
+                self.doc.anchor = None;
+            }
+            _ => self.info("line mode: Esc leaves it"),
+        }
+    }
+
+    fn toggle_thread(&mut self) {
+        let Some(thread) = self.doc.thread_at_cursor() else {
+            return self.info("move to a discussion first: u");
+        };
+        let thread = &self.source.threads[thread];
+        if thread.can_toggle {
+            self.modal = Some(Modal::Confirm(review::toggle(thread)));
+        } else {
+            self.error("GitHub does not let you resolve this discussion");
+        }
+    }
+
+    /// Reply to the discussion under the cursor, or comment on the line.
+    fn write_here(&mut self) {
+        let Some(item) = self.list().selected().cloned() else {
+            return;
+        };
+        let (act, extra, what) = if let Some(n) = self.doc.thread_at_cursor() {
+            let thread = &self.source.threads[n];
+            let first = thread.comments.first().and_then(|c| c.id);
+            match first {
+                Some(id) if thread.can_reply => (
+                    Act::Reply,
+                    id.to_string(),
+                    format!("Reply on {}", thread.path),
+                ),
+                _ => return self.error("GitHub does not let you reply here"),
+            }
+        } else {
+            let place = match self.doc.place() {
+                Ok(place) => place,
+                Err(e) => return self.error(e),
+            };
+            if self.source.oid.is_empty() {
+                return self.error("the commit of these changes is unknown; press Esc, then R");
+            }
+            let what = format!("Comment on {}", place.label());
+            let new = review::NewComment {
+                commit_id: self.source.oid.clone(),
+                place,
+            };
+            match serde_json::to_string(&new) {
+                Ok(extra) => (Act::LineComment, extra, what),
+                Err(e) => return self.error(e),
+            }
+        };
+        let repo = item.repo().to_string();
+        if let Some(mut form) = Form::new(Tab::Prs, act, &repo, Some(item), &extra) {
+            form.title = what;
+            self.modal = Some(Modal::Form(Box::new(form)));
         }
     }
 
@@ -1253,6 +1565,10 @@ impl App {
         let state = item.state();
         let mine = self.is_mine(item);
         match act {
+            Act::Raw => self.source.markdown,
+            Act::NextThread | Act::PrevThread => self.doc.has_threads(),
+            Act::Resolved => self.source.threads.iter().any(|t| t.resolved),
+            Act::Lines => self.doc.has_files(),
             Act::Reviewers => mine && matches!(state, "open" | "draft"),
             Act::Title | Act::Description | Act::Tasks => mine,
             Act::Ready => mine && state == "draft",
@@ -1361,18 +1677,23 @@ impl App {
                 scope.retain(|r| self.in_orgs(&r.1));
                 self.scope = scope;
                 self.clear_lists();
+                self.save_view();
             }
             Pick::Scope => {
                 self.scope = chosen;
+                self.fixed = false; // chosen here, so worth keeping
                 self.clear_lists();
+                self.save_view();
             }
             Pick::Filter => {
                 self.list_mut().filters = chosen;
                 self.reset();
+                self.save_view();
             }
             Pick::State => {
                 self.list_mut().states = chosen;
                 self.reset();
+                self.save_view();
             }
             Pick::Exclude => self.exclude(chosen.into_iter().map(|c| c.1).collect()),
             Pick::Reviewers {
@@ -1531,6 +1852,7 @@ mod tests {
         };
         app.handle(Msg::Done {
             tab: Tab::Prs,
+            reload: false,
             label: "x".into(),
             form: Some(form),
             result: Err(GhError("offline".into())),
@@ -1781,5 +2103,186 @@ mod tests {
         press(&mut app, KeyCode::Char('z'));
         press(&mut app, KeyCode::Esc);
         assert!(!app.zoom && !app.detail_focus);
+    }
+
+    #[test]
+    fn raw_toggle_keeps_the_item() {
+        let mut app = app();
+        app.listed(Tab::Prs, 0, false, page(&[1]));
+        press(&mut app, KeyCode::Char('M'));
+        assert!(app.raw && app.source.markdown);
+        press(&mut app, KeyCode::Char('M'));
+        assert!(!app.raw);
+        assert!(app.applies(Act::Raw));
+        app.show(Source::plain("log".into()));
+        assert!(!app.applies(Act::Raw));
+    }
+
+    fn reviewing() -> App {
+        let mut app = app();
+        app.listed(Tab::Prs, 0, false, page(&[1]));
+        app.detail_focus = true;
+        app.doc_height = 40;
+        let diff = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n-a\n+b\n c\n";
+        app.show(Source {
+            diff: Some(diff.into()),
+            oid: "abc".into(),
+            threads: vec![review::Thread {
+                id: "T".into(),
+                path: "f".into(),
+                line: Some(1),
+                side: "RIGHT".into(),
+                can_reply: true,
+                can_toggle: true,
+                total: 1,
+                comments: vec![review::Comment {
+                    id: Some(9),
+                    body: "why".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Source::default()
+        });
+        app.doc.layout(80);
+        app
+    }
+
+    #[test]
+    fn line_mode_comments_and_keeps_other_keys_away() {
+        let mut app = reviewing();
+        press(&mut app, KeyCode::Char('l'));
+        press(&mut app, KeyCode::Char('m'));
+        assert!(app.modal.is_none() && app.busy.is_none());
+        press(&mut app, KeyCode::Char('j')); // +b
+        press(&mut app, KeyCode::Enter);
+        let Some(Modal::Form(mut form)) = app.modal.take() else {
+            panic!("no form");
+        };
+        assert_eq!(form.title, "Comment on f:1");
+        form.paste("hi");
+        let sent = api::submit(&form).unwrap().stdin.unwrap();
+        for part in [
+            "\"commit_id\":\"abc\"",
+            "\"line\":1",
+            "\"side\":\"RIGHT\"",
+            "\"body\":\"hi\"",
+        ] {
+            assert!(sent.contains(part), "{part} missing in {sent}");
+        }
+        press(&mut app, KeyCode::Esc);
+        assert!(app.doc.cursor.is_none() && app.detail_focus);
+    }
+
+    #[test]
+    fn discussions_can_be_answered_and_resolved() {
+        let mut app = reviewing();
+        press(&mut app, KeyCode::Char('u'));
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(&app.modal, Some(Modal::Form(f)) if f.act == Act::Reply && f.extra == "9")
+        );
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('x'));
+        assert!(matches!(&app.modal, Some(Modal::Confirm(c)) if c.label.starts_with("Resolve")));
+        press(&mut app, KeyCode::Char('n'));
+        app.source.threads[0].can_reply = false;
+        app.source.threads[0].can_toggle = false;
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn resolved_toggle_returns_to_the_discussion() {
+        let mut app = reviewing();
+        app.source.threads[0].resolved = true;
+        app.toggle_resolved();
+        press(&mut app, KeyCode::Char('u'));
+        press(&mut app, KeyCode::Char('O'));
+        assert_eq!(app.doc.thread_at_cursor(), Some(0));
+        assert!(!app.source.show_resolved);
+    }
+
+    #[test]
+    fn merge_needs_the_reviewed_commit_and_no_conflicts() {
+        let mut app = app();
+        app.listed(Tab::Prs, 0, false, page(&[1]));
+        let item = app.list().selected().unwrap().clone();
+        let ready = |oid: &str, conflicts: bool| Readiness {
+            oid: oid.into(),
+            conflicts,
+            methods: vec!["Squash"],
+            notes: vec![(false, "blocked".into())],
+        };
+        app.merge_form(item.clone(), ready("new", false));
+        assert!(app.modal.is_none());
+        app.merge_form(item.clone(), ready("", true));
+        assert!(app.modal.is_none());
+        app.merge_form(item, ready("", false));
+        let Some(Modal::Form(form)) = &app.modal else {
+            panic!("no form");
+        };
+        assert_eq!((form.chosen(0), form.notes.len()), ("Squash", 1));
+    }
+
+    #[test]
+    fn view_is_restored_but_not_over_the_command_line() {
+        let dir = std::env::temp_dir().join(format!("ghdeck-restore-{}", std::process::id()));
+        let path = dir.join("view.json");
+        let pick = |v: &str| vec![(v.to_string(), v.to_string())];
+        let mut app = App::new(mpsc::channel().0, None);
+        app.view_path = Some(path.clone());
+        app.orgs = pick("o");
+        app.scope = pick("o/kept");
+        app.lists[0].states.clear();
+        app.save_view();
+        let saved = config::load_view(&path).unwrap().unwrap();
+
+        let mut next = App::new(mpsc::channel().0, None);
+        next.restore(saved.clone());
+        assert_eq!((next.orgs, next.scope), (pick("o"), pick("o/kept")));
+        assert!(next.lists[0].states.is_empty());
+
+        let mut fixed = App::new(mpsc::channel().0, Some("a/b".into()));
+        fixed.restore(saved);
+        fixed.view_path = Some(path.clone());
+        assert_eq!(fixed.scope, pick("a/b"));
+        fixed.save_view();
+        let again = config::load_view(&path).unwrap().unwrap();
+        assert_eq!(again.repos, pick("o/kept"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn line_mode_survives_a_reload() {
+        let mut app = reviewing();
+        let again = |app: &mut App| {
+            let mut source = Source {
+                diff: app.source.diff.clone(),
+                threads: app.source.threads.clone(),
+                ..Source::default()
+            };
+            // A new discussion came first.
+            source.threads.insert(0, review::Thread::default());
+            let job = app.doc_job;
+            app.handle(Msg::Doc {
+                job,
+                bottom: false,
+                refresh: true,
+                result: Ok(source),
+            });
+        };
+        press(&mut app, KeyCode::Char('u'));
+        again(&mut app);
+        let n = app.doc.thread_at_cursor().unwrap();
+        assert_eq!(app.source.threads[n].id, "T");
+        press(&mut app, KeyCode::Char('x'));
+        assert!(matches!(&app.modal, Some(Modal::Confirm(c)) if c.label.starts_with("Resolve")));
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('j')); // the line after the discussion
+        let before = app.doc.mark();
+        again(&mut app);
+        assert_eq!(app.doc.mark(), before);
     }
 }
