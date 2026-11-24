@@ -1,6 +1,7 @@
 //! GitHub data: list queries, detail documents and mutating commands.
 //! `--jq` trims responses inside `gh`, so only displayed fields reach us.
 
+use crate::doc::Source;
 use crate::form::Form;
 use crate::gh::{self, Cmd, GhError, Guard, Keep, Result};
 use crate::keys::{Act, Tab};
@@ -210,6 +211,14 @@ impl Item {
             )
             .to_lowercase()
             .contains(needle)
+    }
+
+    /// Preview as a document.
+    pub fn source(&self) -> Source {
+        match self {
+            Item::Run(_) => Source::plain(self.preview()),
+            _ => Source::preview(&self.preview()),
+        }
     }
 
     /// Instant preview, built from data the list already holds.
@@ -760,22 +769,13 @@ pub fn workflows(repo: &str) -> Result<Vec<(String, String)>> {
         .collect())
 }
 
-/// A loaded detail document.
-#[derive(Debug, Default)]
-pub struct Detail {
-    pub head: String,
-    pub body: String,
-    pub tail: String,
-    pub diff: Option<String>,
-}
-
 /// Load a detail document.
-pub fn detail(act: Act, item: &Item) -> Result<Detail> {
+pub fn detail(act: Act, item: &Item) -> Result<Source> {
     let is_pr = matches!(item, Item::Ticket(t) if !t.head.is_empty());
     match act {
-        Act::Diff => Ok(Detail {
+        Act::Diff => Ok(Source {
             diff: Some(text(act, item)?),
-            ..Detail::default()
+            ..Source::default()
         }),
         Act::Info if is_pr => {
             let (talk, diff) = thread::scope(|s| {
@@ -794,17 +794,17 @@ pub fn detail(act: Act, item: &Item) -> Result<Detail> {
             let diff = diff
                 .map_err(|e| body = format!("── Changes not available: {e}\n\n{body}"))
                 .ok();
-            Ok(Detail {
+            Ok(Source {
                 head: head.to_string(),
                 body,
                 tail,
                 diff,
+                markdown: true,
             })
         }
-        _ => Ok(Detail {
-            head: text(act, item)?,
-            ..Detail::default()
-        }),
+        // Job lists and logs are not Markdown.
+        Act::Info if !matches!(item, Item::Run(_)) => Ok(Source::preview(&text(act, item)?)),
+        _ => Ok(Source::plain(text(act, item)?)),
     }
 }
 

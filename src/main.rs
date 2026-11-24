@@ -5,6 +5,7 @@ mod doc;
 mod form;
 mod gh;
 mod keys;
+mod markdown;
 mod tasks;
 mod ui;
 

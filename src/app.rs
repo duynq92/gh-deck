@@ -1,8 +1,8 @@
 //! Application state and key handling.
 
-use crate::api::{self, Candidates, Choice, Detail, Item, Page, PrText, Query, Repos, Reviews};
+use crate::api::{self, Candidates, Choice, Item, Page, PrText, Query, Repos, Reviews};
 use crate::config;
-use crate::doc::Doc;
+use crate::doc::{Doc, Source};
 use crate::form::{self, Form};
 use crate::gh::{self, Cmd, GhError, Result};
 use crate::keys::{self, Act, Tab};
@@ -27,7 +27,7 @@ pub enum Msg {
     Doc {
         job: u64,
         bottom: bool,
-        result: Result<Detail>,
+        result: Result<Source>,
     },
     Workflows {
         job: u64,
@@ -229,6 +229,10 @@ pub struct App {
     /// The focused document fills the screen.
     pub zoom: bool,
     pub doc: Doc,
+    /// What `doc` was made of, to switch between rendered and raw.
+    source: Source,
+    /// Show Markdown as it was written.
+    pub raw: bool,
     pub doc_act: Act,
     /// Item the document belongs to.
     doc_id: String,
@@ -266,6 +270,8 @@ impl App {
             detail_focus: false,
             zoom: false,
             doc: Doc::default(),
+            source: Source::default(),
+            raw: false,
             doc_act: Act::Info,
             doc_id: String::new(),
             doc_loading: false,
@@ -394,14 +400,28 @@ impl App {
         } else if self.detail_focus || self.doc_loading {
             return;
         }
-        let text = self
-            .list()
-            .selected()
-            .map(Item::preview)
-            .unwrap_or_default();
-        self.doc = Doc::plain(&text);
+        let source = self.list().selected().map(Item::source);
+        self.show(source.unwrap_or_default());
         self.doc_act = Act::Info;
         self.doc_id = id;
+    }
+
+    fn show(&mut self, source: Source) {
+        self.doc = Doc::new(&source, self.raw);
+        self.source = source;
+    }
+
+    /// Switch between rendered and raw, staying at the same file.
+    fn toggle_raw(&mut self) {
+        self.raw = !self.raw;
+        let file = self.doc.current_file().map(|f| f.0);
+        let width = self.doc.width();
+        self.doc = Doc::new(&self.source, self.raw);
+        if let Some(n) = file {
+            self.doc.layout(width);
+            let height = self.doc_height;
+            self.doc.show_file(n, height);
+        }
     }
 
     fn open_doc(&mut self, act: Act) {
@@ -412,12 +432,11 @@ impl App {
         self.doc_loading = true;
         self.doc_act = act;
         self.detail_focus = true;
-        let text = if act == Act::Info {
-            item.preview()
+        self.show(if act == Act::Info {
+            item.source()
         } else {
-            String::new()
-        };
-        self.doc = Doc::plain(&text);
+            Source::default()
+        });
         let job = self.doc_job;
         self.spawn(move || Msg::Doc {
             job,
@@ -508,7 +527,7 @@ impl App {
                 match result {
                     Ok(d) => {
                         let top = self.doc.top;
-                        self.doc = Doc::new(&d.head, &d.body, d.diff.as_deref(), &d.tail);
+                        self.show(d);
                         // Logs are read from the end; rendering clamps this.
                         self.doc.top = if bottom { usize::MAX } else { top };
                     }
@@ -815,6 +834,7 @@ impl App {
         match act {
             Act::Quit => self.quit = true,
             Act::Help => self.modal = Some(Modal::Help),
+            Act::Raw => self.toggle_raw(),
             Act::Menu => self.modal = Some(Modal::Menu(0)),
             Act::Zoom => {
                 self.zoom = !self.zoom;
@@ -1253,6 +1273,7 @@ impl App {
         let state = item.state();
         let mine = self.is_mine(item);
         match act {
+            Act::Raw => self.source.markdown,
             Act::Reviewers => mine && matches!(state, "open" | "draft"),
             Act::Title | Act::Description | Act::Tasks => mine,
             Act::Ready => mine && state == "draft",
@@ -1781,5 +1802,18 @@ mod tests {
         press(&mut app, KeyCode::Char('z'));
         press(&mut app, KeyCode::Esc);
         assert!(!app.zoom && !app.detail_focus);
+    }
+
+    #[test]
+    fn raw_toggle_keeps_the_item() {
+        let mut app = app();
+        app.listed(Tab::Prs, 0, false, page(&[1]));
+        press(&mut app, KeyCode::Char('M'));
+        assert!(app.raw && app.source.markdown);
+        press(&mut app, KeyCode::Char('M'));
+        assert!(!app.raw);
+        assert!(app.applies(Act::Raw));
+        app.show(Source::plain("log".into()));
+        assert!(!app.applies(Act::Raw));
     }
 }

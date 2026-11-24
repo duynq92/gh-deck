@@ -2,9 +2,10 @@
 
 use crate::api::{self, Choice, Item, Reviews};
 use crate::app::{App, Modal, Picker, Status};
-use crate::doc::{GUTTER, Kind as LineKind, clean};
+use crate::doc::{GUTTER, Kind as LineKind, Visible, clean};
 use crate::form::{Form, Kind, line_at};
 use crate::keys::{self, Act, Group, Key, SCOPE, Tab};
+use crate::markdown as md;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -579,6 +580,11 @@ fn draw_doc(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         ""
     };
+    let name = if app.raw && app.applies(Act::Raw) {
+        format!("{name} (raw)")
+    } else {
+        name.to_string()
+    };
     let mut block = pane(app.detail_focus && app.modal.is_none())
         .title(Line::styled(format!(" {name}{loading} "), BOLD));
     block = block.title_bottom(if app.detail_focus {
@@ -617,7 +623,7 @@ fn draw_doc(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(block, area);
     for (n, row) in app.doc.visible(height).enumerate() {
         let area = Rect::new(inner.x, inner.y + n as u16, inner.width, 1);
-        let (text, background) = doc_line(row.indent, row.text, row.kind);
+        let (text, background) = doc_line(&row);
         frame.render_widget(text, area);
         if let Some(color) = background {
             frame.buffer_mut().set_style(area, Style::new().bg(color));
@@ -626,7 +632,10 @@ fn draw_doc(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// Styled text and the background of the whole row.
-fn doc_line(indent: usize, text: &str, kind: LineKind) -> (Line<'_>, Option<Color>) {
+fn doc_line<'a>(row: &Visible<'a>) -> (Line<'a>, Option<Color>) {
+    // Only rendered Markdown has more than one part.
+    let (kind, indent) = (row.kind, row.indent);
+    let text = row.parts.first().map_or("", |p| p.0);
     let fg = |c| Style::new().fg(c);
     if kind.is_code() {
         let (code, background) = match kind {
@@ -651,20 +660,48 @@ fn doc_line(indent: usize, text: &str, kind: LineKind) -> (Line<'_>, Option<Colo
         };
         return (line, background);
     }
-    match kind {
-        LineKind::Title => (Line::styled(text, BOLD), None),
-        LineKind::Heading => (
-            Line::styled(text, fg(ACCENT).add_modifier(Modifier::BOLD)),
-            None,
-        ),
+    let (base, background) = match kind {
+        LineKind::Title => (BOLD, None),
+        LineKind::Heading => (fg(ACCENT).add_modifier(Modifier::BOLD), None),
         LineKind::File => (
-            Line::styled(text, fg(Color::Indexed(255)).add_modifier(Modifier::BOLD)),
+            fg(Color::Indexed(255)).add_modifier(Modifier::BOLD),
             Some(Color::Indexed(24)),
         ),
-        LineKind::Hunk => (Line::styled(text, fg(Color::Magenta)), None),
-        LineKind::Summary => (summary_line(text), None),
-        _ => (Line::raw(text), None),
+        LineKind::Hunk => (fg(Color::Magenta), None),
+        LineKind::Block => (fg(Color::Indexed(252)), Some(Color::Indexed(236))),
+        LineKind::Summary if indent == 0 => return (summary_line(text), None),
+        _ => (Style::new(), None),
+    };
+    let mut spans = vec![Span::raw(" ".repeat(indent))];
+    let parts = row.parts.iter();
+    spans.extend(parts.map(|(text, bits)| Span::styled(*text, base.patch(inline(*bits)))));
+    (Line::from(spans), background)
+}
+
+/// Style of rendered Markdown.
+fn inline(bits: u8) -> Style {
+    let mut style = Style::new();
+    for (bit, part) in [
+        (md::BOLD, BOLD),
+        (md::ITALIC, Style::new().add_modifier(Modifier::ITALIC)),
+        (md::STRIKE, Style::new().add_modifier(Modifier::CROSSED_OUT)),
+        (
+            md::LINK,
+            Style::new()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::UNDERLINED),
+        ),
+        (
+            md::CODE,
+            Style::new().fg(Color::Indexed(222)).bg(Color::Indexed(236)),
+        ),
+        (md::DIM, DIM),
+    ] {
+        if bits & bit != 0 {
+            style = style.patch(part);
+        }
     }
+    style
 }
 
 /// ` M    +12     -3  path`, as written by `Doc`.
@@ -706,6 +743,7 @@ fn action(app: &App, name: &str, k: &Key, color: Color) -> [Span<'static>; 2] {
     let label = match (k.act, app.list().selected().map(Item::state)) {
         (Act::Toggle, Some("open" | "draft")) => "Close",
         (Act::Toggle, Some("closed")) => "Reopen",
+        (Act::Raw, _) if app.raw => "Rendered",
         _ => k.label,
     };
     let count = match (k.act, app.excluded.len()) {

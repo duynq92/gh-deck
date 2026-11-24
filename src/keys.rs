@@ -51,6 +51,7 @@ pub enum Act {
     More,
     Refresh,
     Zoom,
+    Raw,
     Menu,
     Help,
     Message,
@@ -153,10 +154,11 @@ const PRS: &[Group] = &[
         keys: &[
             k('i', "Info", Act::Info),
             k('d', "Diff", Act::Diff),
-            k('n', "Next/prev file", Act::NextFile),
+            k('n', "Files", Act::NextFile),
             k('N', "", Act::PrevFile),
             k('h', "Checks", Act::Checks),
             k('w', "Web", Act::Web),
+            k('M', "Raw text", Act::Raw),
         ],
     },
     Group {
@@ -194,7 +196,11 @@ const PRS: &[Group] = &[
 const ISSUES: &[Group] = &[
     Group {
         name: "View",
-        keys: &[k('i', "Info", Act::Info), k('w', "Web", Act::Web)],
+        keys: &[
+            k('i', "Info", Act::Info),
+            k('w', "Web", Act::Web),
+            k('M', "Raw text", Act::Raw),
+        ],
     },
     Group {
         name: "Edit",
@@ -217,6 +223,7 @@ const RELEASES: &[Group] = &[
         keys: &[
             k('i', "Info", Act::Info),
             k('w', "Web", Act::Web),
+            k('M', "Raw text", Act::Raw),
             k('D', "Download", Act::Download),
         ],
     },
@@ -280,6 +287,7 @@ pub fn footer(tab: Tab, reading: bool) -> &'static [Act] {
         (Tab::Prs, true) => &[
             NextFile,
             Zoom,
+            Raw,
             Approve,
             RequestChanges,
             Comment,
@@ -310,7 +318,7 @@ pub fn footer(tab: Tab, reading: bool) -> &'static [Act] {
             Web,
         ],
         (Tab::Issues, _) => &[
-            Comment, New, Labels, Assignees, Toggle, Find, Zoom, Web, More, Refresh,
+            Comment, New, Labels, Assignees, Toggle, Find, Zoom, Raw, Web, More, Refresh,
         ],
         (Tab::Releases, _) => &[
             New, Edit, Publish, Download, Delete, Find, Zoom, Web, Refresh,

@@ -1,5 +1,6 @@
 //! Scrollable, lazily rendered text. Only visible rows are ever styled.
 
+use crate::markdown::{self, Look};
 use std::borrow::Cow;
 use std::fmt::Write;
 use unicode_width::UnicodeWidthChar;
@@ -42,6 +43,8 @@ pub fn clean(text: &str) -> Cow<'_, str> {
 pub enum Kind {
     Plain,
     Title,
+    /// A rendered code block.
+    Block,
     Heading,
     /// A file in the "Changed files" summary.
     Summary,
@@ -72,8 +75,11 @@ struct Row {
 #[derive(Default)]
 pub struct Doc {
     text: String,
-    /// Kind of every logical line.
+    /// Kind of every logical line, and how far it is indented when wrapped.
     kinds: Vec<Kind>,
+    hangs: Vec<u8>,
+    /// Byte ranges of `text` with Markdown style bits, in order.
+    styles: Vec<(u32, u32, u8)>,
     /// Logical line and path of every changed file.
     files: Vec<(u32, String)>,
     /// First logical line after the code.
@@ -86,37 +92,115 @@ pub struct Doc {
 /// One visible row: indent of a wrapped line, its text and kind.
 pub struct Visible<'a> {
     pub indent: usize,
-    pub text: &'a str,
+    /// Pieces with their Markdown style bits.
+    pub parts: Vec<(&'a str, u8)>,
     pub kind: Kind,
 }
 
-impl Doc {
-    /// Text that came without changes.
-    pub fn plain(text: &str) -> Self {
-        Doc::new(text, "", None, "")
+/// What a document is made of.
+#[derive(Debug, Default)]
+pub struct Source {
+    pub head: String,
+    /// Shown before the code, `tail` after it.
+    pub body: String,
+    pub tail: String,
+    pub diff: Option<String>,
+    /// `body` and `tail` are Markdown sections, started by `── ` lines.
+    pub markdown: bool,
+}
+
+impl Source {
+    /// Split a preview into its facts and its Markdown.
+    pub fn preview(text: &str) -> Self {
+        let (head, body) = text.split_once("\n\n").unwrap_or((text, ""));
+        Source {
+            head: head.to_string(),
+            body: body.to_string(),
+            markdown: true,
+            ..Source::default()
+        }
     }
 
-    /// A summary of the changed files, the code by file, then the talk.
-    pub fn new(head: &str, body: &str, diff: Option<&str>, tail: &str) -> Self {
+    pub fn plain(text: String) -> Self {
+        Source {
+            head: text,
+            ..Source::default()
+        }
+    }
+}
+
+impl Doc {
+    /// Facts, a summary of the changed files, the code by file, then the talk.
+    pub fn new(source: &Source, raw: bool) -> Self {
         let mut doc = Doc::default();
-        doc.prose(&clean(head));
-        let files = diff.map(|d| parse(&clean(d)));
+        let rendered = source.markdown && !raw;
+        doc.prose(&clean(&source.head));
+        let files = source.diff.as_deref().map(|d| parse(&clean(d)));
         if let Some(files) = &files {
             doc.summary(files);
         }
-        doc.section(body);
+        doc.section(&source.body, rendered);
         for file in files.iter().flatten() {
             doc.file(file);
         }
         doc.files_end = doc.kinds.len() as u32;
-        doc.section(tail);
+        doc.section(&source.tail, rendered);
         doc
     }
 
-    fn section(&mut self, text: &str) {
-        if !text.is_empty() {
-            self.line("", Kind::Plain);
-            self.prose(&clean(text));
+    fn section(&mut self, text: &str, rendered: bool) {
+        if text.is_empty() {
+            return;
+        }
+        self.line("", Kind::Plain);
+        let text = clean(text);
+        if !rendered {
+            return self.prose(&text);
+        }
+        // Rendered one by one, so that an unfinished block ends with its section.
+        let mut rest: &str = &text;
+        while !rest.is_empty() {
+            let (title, after) = match rest.starts_with("── ") {
+                true => rest.split_once('\n').unwrap_or((rest, "")),
+                false => ("", rest),
+            };
+            let next = match after.starts_with("── ") {
+                true => 0,
+                false => after.find("\n── ").map_or(after.len(), |i| i + 1),
+            };
+            if !title.is_empty() {
+                self.line(title, Kind::Heading);
+            }
+            self.markdown(&after[..next]);
+            rest = &after[next..];
+            if !rest.is_empty() {
+                self.line("", Kind::Plain);
+            }
+        }
+    }
+
+    fn markdown(&mut self, source: &str) {
+        for line in markdown::render(source) {
+            // Entities such as `&#27;` may have brought control characters back.
+            let safe = clean(&line.text);
+            let spans = if safe.len() == line.text.len() {
+                line.spans
+            } else {
+                Vec::new()
+            };
+            let kind = match line.look {
+                Look::Text => Kind::Plain,
+                Look::Heading => Kind::Heading,
+                Look::Code => Kind::Block,
+            };
+            self.line(&safe.replace('\n', " "), kind);
+            let start = self.text.len() - safe.len();
+            let at = |i: usize| (start + i) as u32;
+            let styles = spans.into_iter().map(|(a, b, s)| (at(a), at(b), s));
+            self.styles.extend(styles);
+            if let Some(hang) = self.hangs.last_mut() {
+                *hang = line.hang;
+            }
         }
     }
 
@@ -126,6 +210,7 @@ impl Doc {
         }
         self.text.push_str(text);
         self.kinds.push(kind);
+        self.hangs.push(0);
     }
 
     fn prose(&mut self, text: &str) {
@@ -231,16 +316,28 @@ impl Doc {
         let mut offset = 0;
         for (n, text) in self.text.split('\n').enumerate() {
             let kind = self.kinds.get(n).copied().unwrap_or(Kind::Plain);
+            let hang = self.hang(n, width);
+            let words = !kind.is_code() && kind != Kind::Block;
             let (mut start, mut used, mut continued) = (offset, 0, false);
+            // Where the last word ended, and the columns up to there.
+            let mut space: Option<(usize, usize)> = None;
             for (i, c) in text.char_indices() {
                 let w = c.width().unwrap_or(0);
                 if used + w > width as usize {
-                    self.rows.push(row(start, offset + i, n, continued));
-                    start = offset + i;
-                    used = indent(kind, width);
+                    let (end, kept) = match space {
+                        Some((end, columns)) if words && c != ' ' => (end, used - columns),
+                        _ => (offset + i, 0),
+                    };
+                    self.rows.push(row(start, end, n, continued));
+                    start = end;
+                    used = hang + kept;
                     continued = true;
+                    space = None;
                 }
                 used += w;
+                if c == ' ' && !text[..i].trim_start().is_empty() {
+                    space = Some((offset + i + 1, used));
+                }
             }
             self.rows
                 .push(row(start, offset + text.len(), n, continued));
@@ -259,17 +356,60 @@ impl Doc {
     pub fn visible(&self, height: usize) -> impl Iterator<Item = Visible<'_>> {
         self.rows.iter().skip(self.top).take(height).map(|r| {
             let kind = self.kinds.get(r.line as usize).copied();
-            let kind = kind.unwrap_or(Kind::Plain);
             Visible {
                 indent: if r.continued {
-                    indent(kind, self.width)
+                    self.hang(r.line as usize, self.width)
                 } else {
                     0
                 },
-                text: &self.text[r.start as usize..r.end as usize],
-                kind,
+                parts: self.parts(r.start, r.end),
+                kind: kind.unwrap_or(Kind::Plain),
             }
         })
+    }
+
+    /// Cut a row at its style changes.
+    fn parts(&self, start: u32, end: u32) -> Vec<(&str, u8)> {
+        let text = |a: u32, b: u32| &self.text[a as usize..b as usize];
+        let mut parts = Vec::new();
+        let mut at = start;
+        let first = self.styles.partition_point(|s| s.1 <= start);
+        for &(a, b, style) in self.styles[first..].iter().take_while(|s| s.0 < end) {
+            let (a, b) = (a.max(at), b.min(end));
+            if a > at {
+                parts.push((text(at, a), 0));
+            }
+            if b > a {
+                parts.push((text(a, b), style));
+                at = b;
+            }
+        }
+        if at < end || parts.is_empty() {
+            parts.push((text(at, end), 0));
+        }
+        parts
+    }
+
+    /// Indent of a wrapped line; none when there is little room.
+    fn hang(&self, line: usize, width: u16) -> usize {
+        let kind = self.kinds.get(line).copied().unwrap_or(Kind::Plain);
+        let hang = self.hangs.get(line).copied().unwrap_or(0) as usize;
+        match indent(kind, width) {
+            0 if hang * 2 < width as usize => hang,
+            n => n,
+        }
+    }
+
+    /// Show the `n`-th file (from 1) at the top.
+    pub fn show_file(&mut self, n: usize, height: usize) {
+        if let Some((line, _)) = self.files.get(n.saturating_sub(1)) {
+            self.top = self.rows.partition_point(|r| r.line < *line);
+            self.scroll(0, height);
+        }
+    }
+
+    pub fn width(&self) -> u16 {
+        self.width
     }
 
     pub fn scroll(&mut self, by: isize, height: usize) {
@@ -397,6 +537,10 @@ fn parse(diff: &str) -> Vec<File> {
 mod tests {
     use super::*;
 
+    fn text(row: &Visible) -> String {
+        " ".repeat(row.indent) + &row.parts.iter().map(|p| p.0).collect::<String>()
+    }
+
     const DIFF: &str = "diff --git a/src/a b.rs b/src/a b.rs
 index 1..2 100644
 --- a/src/a b.rs
@@ -429,9 +573,9 @@ deleted file mode 100644
 
     #[test]
     fn wraps_wide_text_and_clamps_scroll() {
-        let mut doc = Doc::plain("日本語\n\nabc");
+        let mut doc = Doc::new(&Source::plain("日本語\n\nabc".into()), false);
         doc.layout(4);
-        let rows: Vec<_> = doc.visible(10).map(|r| r.text).collect();
+        let rows: Vec<_> = doc.visible(10).map(|r| text(&r)).collect();
         assert_eq!(rows, ["日本", "語", "", "abc"]);
         doc.scroll(99, 3);
         assert_eq!(doc.top, 1);
@@ -468,7 +612,14 @@ deleted file mode 100644
 
     #[test]
     fn jumps_between_files() {
-        let mut doc = Doc::new("Title", "body", Some(DIFF), "talk");
+        let source = Source {
+            head: "Title".into(),
+            body: "body".into(),
+            tail: "talk".into(),
+            diff: Some(DIFF.into()),
+            markdown: true,
+        };
+        let mut doc = Doc::new(&source, false);
         doc.layout(60);
         assert_eq!(doc.current_file(), None);
         doc.jump(true, 2);
@@ -477,5 +628,68 @@ deleted file mode 100644
         assert_eq!(doc.current_file(), Some((2, 3, "new.png")));
         doc.jump(false, 2);
         assert_eq!(doc.current_file(), Some((1, 3, "src/a b.rs")));
+    }
+
+    fn rows(doc: &mut Doc, width: u16) -> Vec<String> {
+        doc.layout(width);
+        doc.visible(99).map(|r| text(&r)).collect()
+    }
+
+    #[test]
+    fn wraps_at_words_with_hanging_indent() {
+        let source = Source::preview("T\n\n- one two three four");
+        let mut doc = Doc::new(&source, false);
+        assert_eq!(rows(&mut doc, 12), ["T", "", "• one two ", "  three four"]);
+        let mut doc = Doc::new(&Source::plain("abcdefghij kl".into()), false);
+        assert_eq!(rows(&mut doc, 4), ["abcd", "efgh", "ij ", "kl"]);
+    }
+
+    #[test]
+    fn sections_do_not_leak_and_raw_is_untouched() {
+        let body = "── Description\n**b**\n```\nopen\n\n── @al commented\n*hi*";
+        let source = Source {
+            head: "T".into(),
+            body: body.into(),
+            markdown: true,
+            ..Source::default()
+        };
+        let got = rows(&mut Doc::new(&source, false), 60);
+        assert_eq!(
+            got,
+            [
+                "T",
+                "",
+                "── Description",
+                "b",
+                "",
+                "  open",
+                "",
+                "── @al commented",
+                "hi"
+            ]
+        );
+        let got = rows(&mut Doc::new(&source, true), 60);
+        assert_eq!(got.join("\n"), format!("T\n\n{body}"));
+    }
+
+    #[test]
+    fn entities_cannot_bring_escapes_back() {
+        let source = Source::preview("T\n\n**a**&#27;[31m&#x202e;b");
+        let got = rows(&mut Doc::new(&source, false), 60);
+        assert!(!got.concat().contains(['\u{1b}', '\u{202e}']), "{got:?}");
+    }
+
+    #[test]
+    fn styles_follow_wrapped_rows() {
+        let mut doc = Doc::new(&Source::preview("T\n\naa **bb cc** dd"), false);
+        doc.layout(6);
+        let parts: Vec<_> = doc.visible(9).skip(2).map(|r| r.parts).collect();
+        assert_eq!(
+            parts,
+            [
+                vec![("aa ", 0), ("bb ", markdown::BOLD)],
+                vec![("cc", markdown::BOLD), (" dd", 0)]
+            ]
+        );
     }
 }
