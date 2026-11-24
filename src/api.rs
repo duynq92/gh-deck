@@ -9,9 +9,15 @@ use serde::de::DeserializeOwned;
 use std::thread;
 
 const PAGE: usize = 50;
+/// Search is slow on the GitHub side, so its pages are smaller.
+const SEARCH_PAGE: usize = 25;
 const RUN_REPOS: usize = 12;
 const PARALLEL: usize = 4;
 const ALL_REPOS: &str = "OWNER,COLLABORATOR,ORGANIZATION_MEMBER";
+/// Repositories to list at most.
+pub const MAX_REPOS: usize = 500;
+/// Filter value for repositories owned by the user, not their organizations.
+pub const MINE: &str = "OWNER";
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Ticket {
@@ -34,7 +40,6 @@ pub struct Ticket {
     pub base: String,
     #[serde(default)]
     pub oid: String,
-    pub review: Option<String>,
     pub checks: Option<String>,
 }
 
@@ -167,10 +172,8 @@ impl Item {
                 if !t.head.is_empty() {
                     s += &format!("{} ← {}\n", t.base, t.head);
                 }
-                for (name, value) in [("Review", &t.review), ("Checks", &t.checks)] {
-                    if let Some(v) = value {
-                        s += &format!("{name}: {}\n", v.to_lowercase().replace('_', " "));
-                    }
+                if let Some(v) = &t.checks {
+                    s += &format!("Checks: {}\n", v.to_lowercase().replace('_', " "));
                 }
                 for (name, list) in [("Labels", &t.labels), ("Assignees", &t.assignees)] {
                     if !list.is_empty() {
@@ -216,6 +219,7 @@ pub fn date(iso: &str) -> String {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Repos {
     pub login: String,
+    pub orgs: Vec<String>,
     /// Most recently pushed first.
     pub names: Vec<String>,
 }
@@ -241,18 +245,20 @@ pub struct Query {
 pub fn filters(tab: Tab) -> &'static [(&'static str, &'static str)] {
     match tab {
         Tab::Prs => &[
-            ("My repos", ""),
+            ("All repos", ""),
+            ("My repos", MINE),
             ("Involves me", "involves:@me"),
             ("Created by me", "author:@me"),
             ("Review requested", "review-requested:@me"),
         ],
         Tab::Issues => &[
-            ("My repos", ""),
+            ("All repos", ""),
+            ("My repos", MINE),
             ("Involves me", "involves:@me"),
             ("Created by me", "author:@me"),
             ("Assigned to me", "assignee:@me"),
         ],
-        Tab::Releases | Tab::Runs => &[("My repos", "OWNER"), ("All accessible", ALL_REPOS)],
+        Tab::Releases | Tab::Runs => &[("All repos", ""), ("My repos", MINE)],
     }
 }
 
@@ -296,18 +302,30 @@ fn fetch<T: DeserializeOwned>(list: &[&str]) -> Result<T> {
     serde_json::from_str(&text).map_err(|e| GhError(format!("unexpected gh response: {e}")))
 }
 
-pub fn repos() -> Result<Repos> {
-    fetch(&[
-        "api",
-        "graphql",
-        "-f",
-        "query={viewer{login repositories(first:100,\
-         affiliations:[OWNER,COLLABORATOR,ORGANIZATION_MEMBER],\
-         ownerAffiliations:[OWNER,COLLABORATOR,ORGANIZATION_MEMBER],\
-         orderBy:{field:PUSHED_AT,direction:DESC}){nodes{nameWithOwner isArchived}}}}",
-        "--jq",
-        ".data.viewer|{login,names:[.repositories.nodes[]|select(.isArchived|not)|.nameWithOwner]}",
-    ])
+/// One page of repositories and the cursor of the next page.
+pub fn repos(after: Option<&str>) -> Result<(Repos, Option<String>)> {
+    #[derive(Deserialize)]
+    struct Out {
+        #[serde(flatten)]
+        repos: Repos,
+        cursor: Option<String>,
+    }
+    let query = format!(
+        "query=query($after:String){{viewer{{login organizations(first:100){{nodes{{login}}}} \
+         repositories(first:100,after:$after,affiliations:[{ALL_REPOS}],\
+         ownerAffiliations:[{ALL_REPOS}],orderBy:{{field:PUSHED_AT,direction:DESC}}){{\
+         pageInfo{{hasNextPage endCursor}} nodes{{nameWithOwner isArchived}}}}}}}}"
+    );
+    let jq = ".data.viewer|{login,orgs:[.organizations.nodes[].login],\
+         names:[.repositories.nodes[]|select(.isArchived|not)|.nameWithOwner],\
+         cursor:(.repositories.pageInfo|if .hasNextPage then .endCursor else null end)}";
+    let after = after.map(|c| format!("after={c}"));
+    let mut list = vec!["api", "graphql", "-f", &query, "--jq", jq];
+    if let Some(after) = &after {
+        list.extend(["-f", after]);
+    }
+    let out: Out = fetch(&list)?;
+    Ok((out.repos, out.cursor))
 }
 
 pub fn list(q: &Query, repos: &Repos) -> Result<Page> {
@@ -318,18 +336,25 @@ pub fn list(q: &Query, repos: &Repos) -> Result<Page> {
     }
 }
 
-fn search_query(q: &Query, login: &str) -> String {
+fn search_query(q: &Query, repos: &Repos) -> String {
     let kind = if q.tab == Tab::Prs {
         "is:pr"
     } else {
         "is:issue"
     };
     let filter = filters(q.tab)[q.filter].1;
-    let place = match &q.scope {
-        Some(repo) => format!("repo:{repo}"),
-        None if filter.is_empty() => format!("user:{login}"),
-        None => String::new(),
+    let place = match (&q.scope, filter) {
+        (Some(repo), _) => format!("repo:{repo}"),
+        (None, MINE) => format!("user:{}", repos.login),
+        (None, "") => repos
+            .orgs
+            .iter()
+            .fold(format!("user:{}", repos.login), |all, org| {
+                all + " org:" + org
+            }),
+        (None, _) => String::new(),
     };
+    let filter = if filter == MINE { "" } else { filter };
     [
         kind,
         &place,
@@ -357,16 +382,16 @@ fn tickets(q: &Query, repos: &Repos) -> Result<Page> {
     let kind = if q.tab == Tab::Prs {
         format!(
             "... on PullRequest{{{TICKET} isDraft headRefName headRefOid baseRefName \
-             reviewDecision commits(last:1){{nodes{{commit{{statusCheckRollup{{state}}}}}}}}}}"
+             commits(last:1){{nodes{{commit{{statusCheckRollup{{state}}}}}}}}}}"
         )
     } else {
         format!("... on Issue{{{TICKET}}}")
     };
     let query = format!(
-        "query=query($q:String!,$after:String){{search(type:ISSUE,first:{PAGE},query:$q,\
+        "query=query($q:String!,$after:String){{search(type:ISSUE,first:{SEARCH_PAGE},query:$q,\
          after:$after){{issueCount pageInfo{{hasNextPage endCursor}} nodes{{{kind}}}}}}}"
     );
-    let search = format!("q={}", search_query(q, &repos.login));
+    let search = format!("q={}", search_query(q, repos));
     let after = q.cursor.as_ref().map(|c| format!("after={c}"));
     let mut list = vec!["api", "graphql", "-f", &query, "-f", &search];
     if let Some(after) = &after {
@@ -379,8 +404,7 @@ fn tickets(q: &Query, repos: &Repos) -> Result<Page> {
          items:[.nodes[]|select(.number)|{repo:.repository.nameWithOwner,number,title,state,\
          updated:.updatedAt,url,body,author:.author.login,labels:[.labels.nodes[].name],\
          assignees:[.assignees.nodes[].login],draft:(.isDraft//false),head:(.headRefName//\"\"),\
-         oid:(.headRefOid//\"\"),base:(.baseRefName//\"\"),review:.reviewDecision,\
-         checks:.commits.nodes[0].commit.statusCheckRollup.state}]}",
+         oid:(.headRefOid//\"\"),base:(.baseRefName//\"\"),checks:.commits.nodes[0].commit.statusCheckRollup.state}]}",
     ]);
     let out: Out = fetch(&list)?;
     // The search index lags behind changes; trust the live state instead.
@@ -429,7 +453,10 @@ fn releases(q: &Query) -> Result<Page> {
             ])?
         }
         None => {
-            let who = filters(q.tab)[q.filter].1;
+            let who = match filters(q.tab)[q.filter].1 {
+                MINE => MINE,
+                _ => ALL_REPOS,
+            };
             fetch(&[
                 "api",
                 "graphql",
@@ -481,7 +508,7 @@ fn runs(q: &Query, repos: &Repos) -> Result<Page> {
             .names
             .iter()
             .filter(|n| {
-                filters(q.tab)[q.filter].1 == ALL_REPOS
+                filters(q.tab)[q.filter].1 != MINE
                     || n.split('/').next() == Some(repos.login.as_str())
             })
             .take(RUN_REPOS)
@@ -549,7 +576,7 @@ pub fn detail(act: Act, item: &Item) -> Result<String> {
             let (kind, fields) = if t.head.is_empty() {
                 ("issue", "comments")
             } else {
-                ("pr", "comments,reviews")
+                ("pr", "comments,reviews,reviewDecision")
             };
             let thread = get(
                 &[
@@ -561,10 +588,10 @@ pub fn detail(act: Act, item: &Item) -> Result<String> {
                     "--json",
                     fields,
                     "--jq",
-                    "[.comments[]|{a:.author.login,t:.createdAt,b:.body,k:\"commented\"}]\
+                    "(if (.reviewDecision//\"\")!=\"\" then \"Review: \\(.reviewDecision|ascii_downcase|gsub(\"_\";\" \"))\\n\" else empty end),([.comments[]|{a:.author.login,t:.createdAt,b:.body,k:\"commented\"}]\
                      +[.reviews[]?|select(.submittedAt)|{a:.author.login,t:.submittedAt,b:.body,\
                      k:(.state|ascii_downcase)}]|sort_by(.t)[]\
-                     |\"── @\\(.a//\"ghost\") \\(.k) · \\(.t[:10])\\n\\(.b)\\n\"",
+                     |\"── @\\(.a//\"ghost\") \\(.k) · \\(.t[:10])\\n\\(.b)\\n\")",
                 ],
                 gh::JSON,
             )?;
@@ -965,20 +992,25 @@ mod tests {
             state: 0,
             cursor: None,
         };
+        let repos = Repos {
+            login: "me".into(),
+            orgs: vec!["a".into(), "b".into()],
+            names: vec![],
+        };
         let tail = "archived:false sort:updated-desc";
-        assert_eq!(
-            search_query(&q, "me"),
-            format!("is:pr user:me is:open {tail}")
-        );
+        let check = |q: &Query, want: &str| {
+            assert_eq!(search_query(q, &repos), format!("is:pr {want} {tail}"));
+        };
+        check(&q, "user:me org:a org:b is:open");
         q.filter = 1;
-        assert_eq!(
-            search_query(&q, "me"),
-            format!("is:pr involves:@me is:open {tail}")
-        );
+        check(&q, "user:me is:open");
+        q.filter = 2;
+        check(&q, "involves:@me is:open");
         q.scope = Some("o/r".into());
-        q.filter = 0;
+        check(&q, "repo:o/r involves:@me is:open");
+        q.filter = 1;
         q.state = 3;
-        assert_eq!(search_query(&q, "me"), format!("is:pr repo:o/r {tail}"));
+        check(&q, "repo:o/r");
     }
 
     #[test]

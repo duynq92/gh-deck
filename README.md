@@ -54,6 +54,7 @@ actions open a form that is only sent with `Ctrl+S`.
   ones (one request each), 5 runs per repository.
 - The Releases tab without a chosen repository shows the 3 newest releases of the
   50 most recently pushed ones.
-- The repository picker lists the 100 most recently pushed; use
+- All tabs include your organizations; `f` narrows to your own repositories.
+- The repository picker lists the 500 most recently pushed; use
   `gh deck owner/repo` for others.
 - `b` checkout only works when ghdeck was started inside a clone of that repository.

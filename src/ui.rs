@@ -136,7 +136,7 @@ fn draw_context(frame: &mut Frame, app: &App, area: Rect) {
     // Ownership means nothing once a single repository is chosen.
     if filters.len() > 1 && (ticket || app.scope.is_none()) {
         let name = match (list.filter, &app.scope) {
-            (0, Some(_)) => "Everything",
+            (n, Some(_)) if matches!(filters[n].1, "" | api::MINE) => "Everything",
             (n, _) => filters[n].0,
         };
         spans.extend([
