@@ -79,21 +79,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         flow(app, screen.width, 0)
     };
     let height = rows.len() as u16 * if boxed { 3 } else { 1 };
-    let [header, body, bar, status] = Layout::vertical([
+    let [header, body, bar] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(3),
         Constraint::Length(height),
-        Constraint::Length(1),
     ])
     .areas(screen);
 
     draw_header(frame, app, header);
     draw_body(frame, app, body);
     draw_actions(frame, app, bar, &rows, boxed);
-    draw_status(frame, app, status);
 
     match &app.modal {
         Some(Modal::Help) => draw_help(frame, app.tab),
+        Some(Modal::Message(text)) => draw_message(frame, text),
         Some(Modal::Confirm(cmd)) => draw_confirm(frame, &cmd.label),
         Some(Modal::Form(form)) => draw_form(frame, form),
         Some(Modal::Picker(p)) => draw_picker(frame, p),
@@ -125,6 +124,8 @@ enum TabSize {
     Full,
     Short,
     Tiny,
+    /// Only the keys, to make room for a message.
+    Keys,
 }
 
 /// `All`, `name`, `name +2`, or just the count when there is no room.
@@ -168,7 +169,8 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             let name = match size {
                 TabSize::Full => format!(" {} ", tab.title()),
                 TabSize::Short => format!(" {} ", tab.short()),
-                TabSize::Tiny => format!("{} ", tab.tiny()),
+                TabSize::Keys if tab != app.tab => " ".to_string(),
+                TabSize::Tiny | TabSize::Keys => format!("{} ", tab.tiny()),
             };
             let style = if tab == app.tab {
                 Style::new()
@@ -205,11 +207,15 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         (TabSize::Tiny, " ", 4),
         (TabSize::Tiny, "", 1),
     ];
+    let message = status(app);
+    // Long messages are cut; a readable part must stay in the center.
+    let room = message.as_ref().map_or(0, |m| m.0.width().min(40) + 2);
     let mut best = (tabs(TabSize::Tiny), right(" ", 1));
-    'fit: for (size, gap, min) in sizes {
+    let keys_only = message.is_some().then_some((TabSize::Keys, "", 1));
+    'fit: for (size, gap, min) in sizes.into_iter().chain(keys_only) {
         for longest in (min..=40).rev() {
             let (l, r) = (tabs(size), right(gap, longest));
-            let fits = l.width() + r.width() < width;
+            let fits = l.width() + r.width() + room < width;
             best = (l, r);
             if fits {
                 break 'fit;
@@ -217,8 +223,19 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
     let (left, right) = best;
-    frame.render_widget(left, area);
     let len = (right.width() as u16).min(area.width);
+    if let Some((text, style)) = message {
+        let from = area.x + left.width() as u16 + 1;
+        let to = (area.right() - len).saturating_sub(1);
+        let width = (text.width() as u16).min(to.saturating_sub(from));
+        // The middle of the screen, or as close as the neighbors allow.
+        let x = (area.x + area.width.saturating_sub(width) / 2)
+            .min(to.saturating_sub(width))
+            .max(from);
+        let place = Rect::new(x, area.y, width, 1).intersection(area);
+        frame.render_widget(Line::styled(fit(&text, place.width as usize), style), place);
+    }
+    frame.render_widget(left, area);
     let area = Rect::new(area.right() - len, area.y, len, area.height);
     frame.render_widget(right, area);
 }
@@ -720,15 +737,29 @@ fn key_spans(app: &App, group: &Group) -> Vec<Span<'static>> {
     spans
 }
 
-fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
-    let width = area.width as usize;
-    let (text, style) = match (&app.status, &app.busy) {
-        (Some(Status::Error(e)), _) => (format!(" ✗ {e}"), Style::new().fg(Color::Red)),
-        (_, Some(busy)) => (format!(" … {busy}"), Style::new().fg(Color::Yellow)),
-        (Some(Status::Info(i)), _) => (format!(" {i}"), Style::new().fg(Color::Green)),
-        _ => return,
+/// Text and style of the current message.
+fn status(app: &App) -> Option<(String, Style)> {
+    let (text, color) = match (&app.status, &app.busy) {
+        (Some(Status::Error(e)), _) => (format!("✗ {e}"), Color::Red),
+        (_, Some(busy)) => (format!("… {busy}"), Color::Yellow),
+        (Some(Status::Info(i)), _) => (i.clone(), Color::Green),
+        _ => return None,
     };
-    frame.render_widget(Line::styled(fit(&text, width), style), area);
+    let text = clean(&text).replace('\n', " ");
+    Some((text, Style::new().fg(color).add_modifier(Modifier::BOLD)))
+}
+
+fn draw_message(frame: &mut Frame, text: &str) {
+    let block = pane(true)
+        .title(Line::styled(" Message ", BOLD))
+        .title_bottom(hints(&[("any key", "Close")]));
+    let text = clean(text);
+    // Word wrapping may need a little more than the exact number of rows.
+    let height: usize = text.lines().map(|l| l.width() / 62 + 1).sum();
+    let height = u16::try_from(height).unwrap_or(u16::MAX).saturating_add(2);
+    let text = Paragraph::new(text).wrap(Wrap { trim: true });
+    let inner = popup(frame, 76, height, block);
+    frame.render_widget(text, inner);
 }
 
 fn popup(frame: &mut Frame, width: u16, height: u16, block: Block) -> Rect {
@@ -1022,6 +1053,7 @@ mod tests {
     #[test]
     fn survives_tiny_terminals() {
         let mut app = App::new(mpsc::channel().0, None);
+        app.status = Some(Status::Error("no room".into()));
         for (w, h) in [(1, 1), (5, 3), (20, 6)] {
             for modal in [
                 None,
@@ -1096,6 +1128,35 @@ mod tests {
                 reviewer_cell(&mut spans, Some(&reviews), width);
                 let got: usize = spans.iter().map(Span::width).sum();
                 assert_eq!(got, width + 1, "{names:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn message_is_centered_in_the_header() {
+        let mut app = App::new(mpsc::channel().0, Some("o/r".into()));
+        app.status = Some(Status::Info("saved".into()));
+        let text = screen(&mut app, 180, 24);
+        let first: Vec<char> = text.lines().next().unwrap().chars().collect();
+        // TestBackend quotes each row.
+        let middle: String = first[1 + 87..1 + 92].iter().collect();
+        assert_eq!(middle, "saved");
+        assert_eq!(text.matches("saved").count(), 1);
+
+        app.status = Some(Status::Error("something went very wrong ".repeat(9)));
+        for width in [80, 100, 150] {
+            let text = screen(&mut app, width, 24);
+            let first = text.lines().next().unwrap();
+            for part in [
+                "✗ somet",
+                "[1]",
+                "[4]",
+                "Org:",
+                "Repo:",
+                "Filter:",
+                "State:",
+            ] {
+                assert!(first.contains(part), "{width}: {part} missing in {first}");
             }
         }
     }

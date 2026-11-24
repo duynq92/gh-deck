@@ -51,6 +51,7 @@ pub enum Act {
     More,
     Refresh,
     Help,
+    Message,
     Quit,
     // Item
     Info,
@@ -114,6 +115,7 @@ pub const GLOBAL: Group = Group {
         k('>', "More", Act::More),
         k('R', "Refresh", Act::Refresh),
         k('?', "Help", Act::Help),
+        k('!', "Message", Act::Message),
         k('q', "Quit", Act::Quit),
     ],
 };

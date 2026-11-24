@@ -179,6 +179,7 @@ impl Picker {
 
 pub enum Modal {
     Help,
+    Message(String),
     Confirm(Cmd),
     Form(Box<Form>),
     Picker(Picker),
@@ -215,6 +216,8 @@ pub struct App {
     pick_job: u64,
     pub busy: Option<String>,
     pub status: Option<Status>,
+    /// The latest message, kept after it left the header.
+    last_message: Option<String>,
     pub quit: bool,
     /// Heights of the last drawn panes, for paging.
     pub list_height: usize,
@@ -248,6 +251,7 @@ impl App {
             pick_job: 0,
             busy: None,
             status: None,
+            last_message: None,
             quit: false,
             list_height: 1,
             doc_height: 1,
@@ -670,7 +674,9 @@ impl App {
             self.find_key(key);
             return;
         }
-        self.status = None;
+        if let Some(Status::Info(text) | Status::Error(text)) = self.status.take() {
+            self.last_message = Some(text);
+        }
         match key.code {
             KeyCode::Char('d') if ctrl => self.step(self.page() / 2),
             KeyCode::Char('u') if ctrl => self.step(-self.page() / 2),
@@ -767,6 +773,10 @@ impl App {
         match act {
             Act::Quit => self.quit = true,
             Act::Help => self.modal = Some(Modal::Help),
+            Act::Message => {
+                let text = self.last_message.clone();
+                self.modal = Some(Modal::Message(text.unwrap_or("no message yet".into())));
+            }
             Act::Repo => self.pick_scope(),
             Act::Find => {
                 self.detail_focus = false;
@@ -1086,7 +1096,7 @@ impl App {
     fn modal_key(&mut self, modal: Modal, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match modal {
-            Modal::Help => {}
+            Modal::Help | Modal::Message(_) => {}
             Modal::Confirm(cmd) => match key.code {
                 KeyCode::Char('y') => self.execute(cmd, None),
                 KeyCode::Char('n') | KeyCode::Esc => {}
@@ -1478,5 +1488,17 @@ mod tests {
         app.load(Tab::Prs, false);
         app.handle(Msg::Teams(Err(GhError("no scope".into()))));
         assert!(!app.lists[0].waiting && app.lists[0].loading);
+    }
+
+    #[test]
+    fn last_message_can_be_read_again() {
+        let mut app = app();
+        app.error("a long error");
+        press(&mut app, KeyCode::Char('j')); // leaves the header
+        assert!(app.status.is_none());
+        press(&mut app, KeyCode::Char('!'));
+        assert!(matches!(&app.modal, Some(Modal::Message(t)) if t == "a long error"));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.modal.is_none());
     }
 }
