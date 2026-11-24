@@ -706,33 +706,74 @@ fn group_color(group: &Group) -> Color {
     }
 }
 
-/// Put the action groups on as few rows as possible.
-fn flow(app: &App, width: u16, border: usize) -> Vec<Vec<(&'static Group, u16)>> {
-    let mut rows: Vec<Vec<(&'static Group, u16)>> = vec![Vec::new()];
+type Placed = (&'static Group, u16);
+
+/// Put the action groups on as few rows as possible. Their order changes only
+/// when that saves a row or keeps General from standing alone.
+fn flow(app: &App, width: u16, border: usize) -> Vec<Vec<Placed>> {
+    let mut groups: Vec<Placed> = keys::groups(app.tab)
+        .iter()
+        .chain([&GLOBAL])
+        .map(|group| {
+            let title = if border > 0 { 0 } else { group.name.len() + 3 };
+            let keys: usize = key_spans(app, group).iter().map(Span::width).sum();
+            (group, (keys + title + border) as u16)
+        })
+        .collect();
+    let mut best = fill(&groups, width);
+    let mut cost = waste(&best);
+    permute(&mut groups, 0, &mut |order| {
+        let rows = fill(order, width);
+        let new = waste(&rows);
+        if new < cost {
+            (best, cost) = (rows, new);
+        }
+    });
+    // General always comes last.
+    let general = |g: &Placed| g.0.name == GLOBAL.name;
+    best.sort_by_key(|row| row.iter().any(general));
+    for row in &mut best {
+        row.sort_by_key(general);
+    }
+    best
+}
+
+fn fill(groups: &[Placed], width: u16) -> Vec<Vec<Placed>> {
+    let mut rows: Vec<Vec<Placed>> = Vec::new();
     let mut used = 0;
-    for group in keys::groups(app.tab).iter().chain([&GLOBAL]) {
-        let title = if border > 0 { 0 } else { group.name.len() + 3 };
-        let keys: usize = key_spans(app, group).iter().map(Span::width).sum();
-        let len = keys + title + border;
-        if used > 0 && used + len > width as usize {
-            rows.push(Vec::new());
-            used = 0;
+    for &(group, len) in groups {
+        match rows.last_mut() {
+            Some(row) if used + len <= width => row.push((group, len)),
+            _ => {
+                rows.push(vec![(group, len)]);
+                used = 0;
+            }
         }
         used += len;
-        if let Some(row) = rows.last_mut() {
-            row.push((group, len as u16));
-        }
     }
     rows
 }
 
-fn draw_actions(
-    frame: &mut Frame,
-    app: &App,
-    area: Rect,
-    rows: &[Vec<(&'static Group, u16)>],
-    boxed: bool,
-) {
+/// Rows, then whether General is alone although there are other groups.
+fn waste(rows: &[Vec<Placed>]) -> (usize, bool) {
+    let alone = |row: &Vec<Placed>| row.len() == 1 && row[0].0.name == GLOBAL.name;
+    (rows.len(), rows.iter().any(alone))
+}
+
+/// Visit every order; there are at most six groups.
+fn permute(groups: &mut [Placed], from: usize, visit: &mut impl FnMut(&[Placed])) {
+    if from == groups.len() {
+        return visit(groups);
+    }
+    for i in from..groups.len() {
+        // Rotating, unlike swapping, keeps the rest in their usual order.
+        groups[from..=i].rotate_right(1);
+        permute(groups, from + 1, visit);
+        groups[from..=i].rotate_left(1);
+    }
+}
+
+fn draw_actions(frame: &mut Frame, app: &App, area: Rect, rows: &[Vec<Placed>], boxed: bool) {
     let height = if boxed { 3 } else { 1 };
     let mut y = area.y;
     for row in rows {
@@ -771,7 +812,7 @@ fn draw_actions(
 
 fn key_spans(app: &App, group: &Group) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
-    for k in group.keys {
+    for (name, k) in group.shown() {
         let label = match (k.act, app.list().selected().map(Item::state)) {
             (Act::Toggle, Some("open" | "draft")) => "Close",
             (Act::Toggle, Some("closed")) => "Reopen",
@@ -788,7 +829,7 @@ fn key_spans(app: &App, group: &Group) -> Vec<Span<'static>> {
             _ => false,
         });
         if off {
-            spans.push(Span::styled(format!("[{}] {label} ", k.key), DIM));
+            spans.push(Span::styled(format!("[{name}] {label} "), DIM));
             continue;
         }
         let count = match (k.act, app.excluded.len()) {
@@ -796,7 +837,7 @@ fn key_spans(app: &App, group: &Group) -> Vec<Span<'static>> {
             _ => String::new(),
         };
         let style = if risky { KEY.fg(Color::Red) } else { KEY };
-        spans.push(Span::styled(format!("[{}]", k.key), style));
+        spans.push(Span::styled(format!("[{name}]"), style));
         spans.push(Span::raw(format!(" {label}{count} ")));
     }
     spans
@@ -878,11 +919,7 @@ fn draw_help(frame: &mut Frame, tab: Tab) {
             format!(" {}", group.name.to_uppercase()),
             Style::new().fg(ACCENT),
         ));
-        let list: Vec<(String, &str)> = group
-            .keys
-            .iter()
-            .map(|k| (k.key.to_string(), k.label))
-            .collect();
+        let list: Vec<(String, &str)> = group.shown().map(|(n, k)| (n, k.label)).collect();
         let list: Vec<(&str, &str)> = list.iter().map(|(k, l)| (k.as_str(), *l)).collect();
         for row in list.chunks(4) {
             lines.push(hints(row));
@@ -1108,16 +1145,14 @@ mod tests {
                 text.contains("Org:All") && text.contains("Repo:All"),
                 "{tab:?}"
             );
-            for k in keys::groups(tab)
-                .iter()
-                .chain([&GLOBAL])
-                .flat_map(|g| g.keys)
-            {
-                assert!(
-                    text.contains(&format!("[{}] {}", k.key, k.label)),
-                    "{tab:?} {}",
-                    k.label
-                );
+            for group in keys::groups(tab).iter().chain([&GLOBAL]) {
+                for (name, k) in group.shown() {
+                    assert!(
+                        text.contains(&format!("[{name}] {}", k.label)),
+                        "{tab:?} {}",
+                        k.label
+                    );
+                }
             }
         }
     }
@@ -1231,5 +1266,24 @@ mod tests {
                 assert!(first.contains(part), "{width}: {part} missing in {first}");
             }
         }
+    }
+
+    #[test]
+    fn general_shares_a_row() {
+        let mut app = App::new(mpsc::channel().0, None);
+        for tab in Tab::ALL {
+            app.tab = tab;
+            let count = keys::groups(tab).len() + 1;
+            for width in (120..=240).step_by(5) {
+                let rows = flow(&app, width, 2);
+                assert!(!waste(&rows).1, "{tab:?} {width}");
+                assert_eq!(rows.iter().map(Vec::len).sum::<usize>(), count);
+                for row in rows {
+                    assert!(row.iter().map(|g| g.1).sum::<u16>() <= width);
+                }
+            }
+        }
+        app.tab = Tab::Prs;
+        assert_eq!(flow(&app, 150, 2).len(), 2);
     }
 }
