@@ -8,9 +8,8 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use std::thread;
 
+/// Rows a list shows at first.
 const PAGE: usize = 50;
-/// Search is slow on the GitHub side, so its pages are smaller.
-const SEARCH_PAGE: usize = 25;
 const RUN_REPOS: usize = 12;
 const PARALLEL: usize = 4;
 const ALL_REPOS: &str = "OWNER,COLLABORATOR,ORGANIZATION_MEMBER";
@@ -345,10 +344,8 @@ pub fn filters(tab: Tab, teams: &[String]) -> Vec<Choice> {
                 item("Opened by me", "author:@me"),
                 item("Review requested: me", "user-review-requested:@me"),
             ];
-            if !teams.is_empty() {
-                all.push(item("Review requested: my teams", MY_TEAMS));
-            }
             all.push(item("Involves me", "involves:@me"));
+            all.push(item("Review requested: my teams", MY_TEAMS));
             for team in teams {
                 let value = format!("team-review-requested:{team}");
                 all.push((format!("Review requested: {team}"), value));
@@ -361,6 +358,14 @@ pub fn filters(tab: Tab, teams: &[String]) -> Vec<Choice> {
             item("Involves me", "involves:@me"),
         ],
         Tab::Releases | Tab::Runs => Vec::new(),
+    }
+}
+
+/// Pull requests start with the ones that concern the user.
+pub fn default_filters(tab: Tab) -> Vec<Choice> {
+    match tab {
+        Tab::Prs => filters(tab, &[]),
+        Tab::Issues | Tab::Releases | Tab::Runs => Vec::new(),
     }
 }
 
@@ -554,9 +559,17 @@ fn tickets(q: &Query, repos: &Repos) -> Result<Page> {
     } else {
         format!("... on Issue{{{TICKET}}}")
     };
+    if q.filters.iter().all(|f| f.1 == MY_TEAMS) && !q.filters.is_empty() && repos.teams.is_empty()
+    {
+        // Without a team the query would match everything.
+        return Ok(Page {
+            warning: Some("you are in no team, or all your teams are excluded".into()),
+            ..Page::default()
+        });
+    }
     let search = search_query(q, repos);
     let query = format!(
-        "query=query($q:String!,$after:String){{search(type:ISSUE_ADVANCED,first:{SEARCH_PAGE},query:$q,\
+        "query=query($q:String!,$after:String){{search(type:ISSUE_ADVANCED,first:{PAGE},query:$q,\
          after:$after){{issueCount pageInfo{{hasNextPage endCursor}} nodes{{{kind}}}}}}}"
     );
     let search = format!("q={search}");
@@ -604,7 +617,7 @@ fn releases(q: &Query) -> Result<Page> {
     // One aliased field per repository or owner, all in a single request.
     let order = "orderBy:{field:PUSHED_AT,direction:DESC}";
     let (query, nodes) = if !q.repos.is_empty() {
-        let count = if q.repos.len() == 1 { PAGE } else { 10 };
+        let count = share(q.repos.len());
         let mut query = String::new();
         for (n, (_, repo)) in q.repos.iter().enumerate() {
             let (owner, name) = split(repo)?;
@@ -641,11 +654,17 @@ fn releases(q: &Query) -> Result<Page> {
         &format!("{nodes}|{map}"),
     ])?;
     let total = list.len();
+    let list: Vec<Release> = list.into_iter().take(PAGE).collect();
     Ok(Page {
         items: list.into_iter().map(Item::Release).collect(),
         total,
         ..Page::default()
     })
+}
+
+/// Rows to ask of each of `n` repositories, enough to fill a page together.
+fn share(n: usize) -> usize {
+    (2 * PAGE / n.max(1)).clamp(10, PAGE)
 }
 
 fn split(repo: &str) -> Result<(&str, &str)> {
@@ -681,11 +700,7 @@ fn runs(q: &Query, repos: &Repos) -> Result<Page> {
     } else {
         q.repos.iter().map(|r| r.1.as_str()).collect()
     };
-    let count = match names.len() {
-        1 => PAGE,
-        2..=5 => 15,
-        _ => 5,
-    };
+    let count = share(names.len());
     // The endpoint takes a single status.
     let statuses: Vec<&str> = match q.states.as_slice() {
         [] => vec![""],
@@ -724,7 +739,7 @@ fn runs(q: &Query, repos: &Repos) -> Result<Page> {
     all.sort_by(|a, b| b.updated.cmp(&a.updated));
     Ok(Page {
         total: all.len(),
-        items: all.into_iter().map(Item::Run).collect(),
+        items: all.into_iter().take(PAGE).map(Item::Run).collect(),
         cursor: None,
         warning: (!errors.is_empty())
             .then(|| format!("{} requests failed: {}", errors.len(), errors.join("; "))),
@@ -1487,5 +1502,28 @@ mod tests {
             cmd.label,
             "o/r#7: request review from bo, o/x; withdraw request to o/team"
         );
+    }
+
+    #[test]
+    fn no_team_left_matches_nothing() {
+        let q = Query {
+            tab: Tab::Prs,
+            orgs: vec![],
+            repos: vec![],
+            filters: vec![choice("teams", MY_TEAMS)],
+            states: vec![],
+            cursor: None,
+        };
+        // Answers without asking GitHub.
+        let page = list(&q, &Repos::default()).unwrap();
+        assert!(page.items.is_empty() && page.warning.is_some());
+    }
+
+    #[test]
+    fn shares_fill_a_page() {
+        for n in 1..=12 {
+            assert!(share(n) <= PAGE && share(n) * n >= PAGE, "{n}");
+        }
+        assert_eq!(share(1000), 10);
     }
 }

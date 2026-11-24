@@ -1,5 +1,6 @@
 mod api;
 mod app;
+mod config;
 mod doc;
 mod form;
 mod gh;
