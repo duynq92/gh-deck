@@ -85,6 +85,19 @@ pub fn save_view(path: &Path, view: &View) -> io::Result<()> {
     write(path, &serde_json::to_string_pretty(view)?)
 }
 
+/// Keys of the events that were seen, oldest first.
+pub fn load_seen(path: &Path) -> io::Result<Vec<String>> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(serde_json::from_str(&text)?),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
+pub fn save_seen(path: &Path, seen: &[String]) -> io::Result<()> {
+    write(path, &serde_json::to_string(seen)?)
+}
+
 /// Settings of the AI review; a missing file means none.
 pub fn load_ai(path: &Path) -> io::Result<Settings> {
     let text = match fs::read_to_string(path) {

@@ -11,7 +11,7 @@ use crate::keys::{self, Act, Tab};
 use crate::review;
 use crate::tasks;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
@@ -89,6 +89,8 @@ pub struct List {
     pub filters: Vec<Choice>,
     pub states: Vec<Choice>,
     pub find: String,
+    /// Events of bots are listed too.
+    pub bots: bool,
     job: u64,
 }
 
@@ -101,6 +103,7 @@ impl List {
         let needle = self.find.to_lowercase();
         self.view = (0..self.items.len())
             .filter(|&i| needle.is_empty() || self.items[i].matches(&needle))
+            .filter(|&i| self.bots || !matches!(&self.items[i], Item::Event(e) if e.bot))
             .collect();
         self.sel = self.sel.min(self.view.len().saturating_sub(1));
     }
@@ -234,7 +237,7 @@ pub enum Status {
 pub struct App {
     tx: Sender<Msg>,
     pub tab: Tab,
-    pub lists: [List; 4],
+    pub lists: [List; 5],
     /// Chosen organizations (or the user).
     pub orgs: Vec<Choice>,
     /// Chosen repositories.
@@ -255,6 +258,14 @@ pub struct App {
     ai_job: u64,
     /// Action that runs when the changes are loaded.
     pending: Option<Act>,
+    /// Comment to show when the document is loaded.
+    jump: Option<u64>,
+    /// Keys of seen events, oldest first.
+    seen: Vec<String>,
+    seen_path: Option<PathBuf>,
+    /// Events and pull requests with something new.
+    pub unread: HashSet<String>,
+    pub unread_prs: HashSet<String>,
     /// Findings by item, only until the app ends.
     reviews: HashMap<String, Review>,
     /// A repository was given on the command line: do not save it.
@@ -309,6 +320,11 @@ impl App {
             ai_running: None,
             ai_job: 0,
             pending: None,
+            jump: None,
+            seen: Vec::new(),
+            seen_path: None,
+            unread: HashSet::new(),
+            unread_prs: HashSet::new(),
             reviews: HashMap::new(),
             fixed,
             modal: None,
@@ -343,6 +359,15 @@ impl App {
                 self.config = Some(teams);
             }
             Err(e) => self.error(format!("{}: {e}", teams.display())),
+        }
+        if let Some(path) = config::path("seen.json") {
+            match config::load_seen(&path) {
+                Ok(seen) => {
+                    self.seen = seen;
+                    self.seen_path = Some(path);
+                }
+                Err(e) => self.error(format!("{}: {e}", path.display())),
+            }
         }
         if let Some(path) = config::path("ai.json") {
             match config::load_ai(&path) {
@@ -399,6 +424,7 @@ impl App {
         self.load_config();
         self.load_repos(None);
         self.load(self.tab, false);
+        self.load(Tab::Activity, false);
     }
 
     fn load_repos(&mut self, after: Option<String>) {
@@ -407,6 +433,14 @@ impl App {
 
     pub fn list(&self) -> &List {
         &self.lists[self.tab as usize]
+    }
+
+    /// The selected item; for an event, its pull request.
+    pub fn current(&self) -> Option<&Item> {
+        self.list().selected().map(|item| match item {
+            Item::Event(e) => &*e.pr,
+            item => item,
+        })
     }
 
     fn list_mut(&mut self) -> &mut List {
@@ -437,8 +471,11 @@ impl App {
 
     fn load(&mut self, tab: Tab, append: bool) {
         let list = &mut self.lists[tab as usize];
-        let teams = list.filters.iter().any(|f| f.1 == api::MY_TEAMS) && !self.teams_ready;
-        list.waiting = teams || (self.repos.is_none() && self.scope.is_empty());
+        let activity = tab == Tab::Activity;
+        let mine = activity || list.filters.iter().any(|f| f.1 == api::MY_TEAMS);
+        list.waiting = (mine && !self.teams_ready)
+            || (activity && self.repos.is_none())
+            || (self.repos.is_none() && self.scope.is_empty());
         if list.waiting {
             list.job += 1; // ignore an older list still in flight
             list.loading = true;
@@ -487,7 +524,7 @@ impl App {
 
     /// Show the preview of the selected item unless its document is open.
     fn sync_doc(&mut self) {
-        let id = self.list().selected().map(Item::id).unwrap_or_default();
+        let id = self.current().map(Item::id).unwrap_or_default();
         if id == self.doc_id && self.doc_act != Act::Info {
             return;
         }
@@ -504,6 +541,49 @@ impl App {
         self.show(source.unwrap_or_default());
         self.doc_act = Act::Info;
         self.doc_id = id;
+    }
+
+    /// Remember everything on a pull request as seen; "" is all of them.
+    fn see(&mut self, id: &str) {
+        let events = self.lists[Tab::Activity as usize].items.iter();
+        let keys: Vec<String> = events
+            .filter_map(|item| match item {
+                Item::Event(e) if id.is_empty() || e.pr.id() == id => Some(e.key.clone()),
+                _ => None,
+            })
+            .filter(|key| self.unread.contains(key))
+            .collect();
+        if keys.is_empty() {
+            return;
+        }
+        self.seen.extend(keys);
+        // Far more than one load brings; older ones do not come back.
+        let extra = self.seen.len().saturating_sub(3_000);
+        self.seen.drain(..extra);
+        self.count_unread();
+        if let Some(path) = &self.seen_path
+            && let Err(e) = config::save_seen(path, &self.seen)
+        {
+            let text = format!("{}: {e}", path.display());
+            self.error(text);
+        }
+    }
+
+    fn count_unread(&mut self) {
+        let list = &self.lists[Tab::Activity as usize];
+        let seen: HashSet<&String> = self.seen.iter().collect();
+        let mut unread = HashSet::new();
+        let mut prs = HashSet::new();
+        for item in &list.items {
+            if let Item::Event(e) = item
+                && (list.bots || !e.bot)
+                && !seen.contains(&e.key)
+            {
+                unread.insert(e.key.clone());
+                prs.insert(e.pr.id());
+            }
+        }
+        (self.unread, self.unread_prs) = (unread, prs);
     }
 
     /// Attach the findings of this item.
@@ -536,13 +616,19 @@ impl App {
     }
 
     fn open_doc(&mut self, act: Act) {
-        let Some(item) = self.list().selected().cloned() else {
+        let Some(item) = self.current().cloned() else {
             return;
         };
         self.doc_job += 1;
         self.doc_loading = true;
         self.doc_act = act;
         self.detail_focus = true;
+        self.jump = match (self.list().selected(), act) {
+            (Some(Item::Event(e)), Act::Info | Act::Diff) => e.comment,
+            _ => None,
+        };
+        self.doc_id = item.id();
+        self.see(&item.id());
         self.show(if act == Act::Info {
             item.source()
         } else {
@@ -559,7 +645,7 @@ impl App {
 
     /// Load the open document again without losing the place.
     fn refresh_doc(&mut self) {
-        let Some(item) = self.list().selected().cloned() else {
+        let Some(item) = self.current().cloned() else {
             return;
         };
         self.doc_job += 1;
@@ -675,6 +761,14 @@ impl App {
                         if let Some(mark) = mark {
                             self.doc.layout(width);
                             self.doc.seek(&mark, height);
+                        }
+                        if let Some(id) = self.jump.take() {
+                            let has =
+                                |t: &review::Thread| t.comments.iter().any(|c| c.id == Some(id));
+                            if let Some(n) = self.source.threads.iter().position(has) {
+                                self.doc.layout(width);
+                                self.doc.seek(&Mark::Thread(n), height);
+                            }
                         }
                         if let Some(act) = self.pending.take() {
                             // Not again: it would load forever.
@@ -799,6 +893,9 @@ impl App {
                         let last = out.trim().lines().last().unwrap_or("").to_string();
                         self.info(format!("✓ {label} {last}"));
                         self.load(tab, false);
+                        if tab == Tab::Prs {
+                            self.load(Tab::Activity, false);
+                        }
                         // Posted findings are discussions now.
                         if let Some(form) = form.filter(|f| f.act == Act::AiPost)
                             && let Some(item) = &form.item
@@ -863,6 +960,9 @@ impl App {
                 }
                 if tab == self.tab {
                     self.sync_doc();
+                }
+                if tab == Tab::Activity {
+                    self.count_unread();
                 }
                 // GitHub answers two small requests faster than a big one.
                 for ids in ids.chunks(25) {
@@ -953,9 +1053,11 @@ impl App {
             KeyCode::PageUp => self.step(-self.page()),
             KeyCode::Char('g') | KeyCode::Home => self.step(isize::MIN),
             KeyCode::Char('G') | KeyCode::End => self.step(isize::MAX),
-            KeyCode::Tab => self.switch((self.tab as usize + 1) % 4),
-            KeyCode::BackTab => self.switch((self.tab as usize + 3) % 4),
-            KeyCode::Char(c @ '1'..='4') => self.switch(c as usize - '1' as usize),
+            KeyCode::Tab => self.switch((self.tab as usize + 1) % Tab::ALL.len()),
+            KeyCode::BackTab => {
+                self.switch((self.tab as usize + Tab::ALL.len() - 1) % Tab::ALL.len())
+            }
+            KeyCode::Char(c @ '1'..='5') => self.switch(c as usize - '1' as usize),
             KeyCode::Enter if !self.detail_focus => self.open_doc(Act::Info),
             KeyCode::Esc => self.back(),
             KeyCode::Char(c) => {
@@ -1042,6 +1144,17 @@ impl App {
         match act {
             Act::Quit => self.quit = true,
             Act::Help => self.modal = Some(Modal::Help),
+            Act::Seen => {
+                self.see("");
+                self.info("everything is marked as seen");
+            }
+            Act::Bots => {
+                let list = &mut self.lists[Tab::Activity as usize];
+                list.bots = !list.bots;
+                list.refilter();
+                self.count_unread();
+                self.sync_doc();
+            }
             Act::Raw => self.toggle_raw(),
             Act::Ai => self.ai_key(),
             Act::AiPost => self.ai_post(),
@@ -1108,6 +1221,9 @@ impl App {
                     self.load_repos(None);
                 }
                 self.load(self.tab, false);
+                if self.tab == Tab::Prs {
+                    self.load(Tab::Activity, false);
+                }
                 if self.detail_focus {
                     self.refresh_doc();
                 }
@@ -1118,7 +1234,7 @@ impl App {
                 _ => self.pick_target(act),
             },
             _ => {
-                if let Some(item) = self.list().selected().cloned() {
+                if let Some(item) = self.current().cloned() {
                     self.item_act(act, item);
                 }
             }
@@ -1411,7 +1527,7 @@ impl App {
             }
             return self.info("AI review stopped");
         }
-        let Some(Item::Ticket(t)) = self.list().selected() else {
+        let Some(Item::Ticket(t)) = self.current() else {
             return;
         };
         let repo = t.repo.clone();
@@ -1455,7 +1571,7 @@ impl App {
     }
 
     fn ai_run(&mut self, tool: Tool) {
-        let Some(Item::Ticket(t)) = self.list().selected().cloned() else {
+        let Some(Item::Ticket(t)) = self.current().cloned() else {
             return;
         };
         let Some(diff) = &self.source.diff else {
@@ -1548,7 +1664,7 @@ impl App {
     }
 
     fn ai_edit(&mut self, n: usize) {
-        let Some(item) = self.list().selected().cloned() else {
+        let Some(item) = self.current().cloned() else {
             return;
         };
         let finding = self
@@ -1589,7 +1705,7 @@ impl App {
     }
 
     fn ai_post(&mut self) {
-        let Some(item) = self.list().selected().cloned() else {
+        let Some(item) = self.current().cloned() else {
             return;
         };
         let Some(review) = self.source.ai.as_ref().filter(|r| r.accepted() > 0) else {
@@ -1612,7 +1728,7 @@ impl App {
 
     /// Reply to the discussion under the cursor, or comment on the line.
     fn write_here(&mut self) {
-        let Some(item) = self.list().selected().cloned() else {
+        let Some(item) = self.current().cloned() else {
             return;
         };
         let (act, extra, what) = if let Some(thread) = self
@@ -1717,7 +1833,7 @@ impl App {
     /// Choose the repository an action applies to.
     fn pick_target(&mut self, act: Act) {
         let mut items: Vec<Choice> = Vec::new();
-        if let Some(item) = self.list().selected() {
+        if let Some(item) = self.current() {
             // The selected item's repository is the likely target.
             items.push((item.repo().into(), item.repo().into()));
         }
@@ -1894,11 +2010,15 @@ impl App {
                 | Act::Quit
                 | Act::New
                 | Act::Trigger
+                | Act::Bots
         );
         if anytime {
             return true;
         }
-        let Some(item) = self.list().selected() else {
+        if act == Act::Seen {
+            return !self.unread.is_empty();
+        }
+        let Some(item) = self.current() else {
             return false;
         };
         let state = item.state();
@@ -2008,6 +2128,7 @@ impl App {
             *list = List {
                 filters: std::mem::take(&mut list.filters),
                 states: std::mem::take(&mut list.states),
+                bots: list.bots,
                 job: list.job + 1, // ignore lists still in flight
                 ..List::default()
             };
@@ -2935,5 +3056,96 @@ mod tests {
         press(&mut app, KeyCode::Char('l'));
         app.feed_doc(false, Ok(loaded(Some(diff))));
         assert!(app.doc.cursor.is_some());
+    }
+
+    fn events(keys: &[(&str, u64, bool)]) -> Result<Page> {
+        let items = keys.iter().map(|&(key, number, bot)| {
+            let pr = page(&[number]).unwrap().items.remove(0);
+            Item::Event(crate::activity::Event {
+                key: key.into(),
+                text: format!("◆ al commented {key}"),
+                at: String::new(),
+                bot,
+                comment: (key == "b").then_some(9),
+                pr: Box::new(pr),
+            })
+        });
+        Ok(Page {
+            items: items.collect(),
+            ..Page::default()
+        })
+    }
+
+    #[test]
+    fn activity_is_seen_by_opening_or_all_at_once() {
+        let dir = std::env::temp_dir().join(format!("ghdeck-seen-{}", std::process::id()));
+        let path = dir.join("seen.json");
+        let mut app = app();
+        app.seen_path = Some(path.clone());
+        app.listed(Tab::Prs, 0, false, page(&[1, 2]));
+        app.feed(
+            Tab::Activity,
+            false,
+            events(&[
+                ("a", 1, false),
+                ("b", 1, false),
+                ("c", 2, false),
+                ("bot", 2, true),
+            ]),
+        );
+        assert_eq!(app.unread.len(), 3, "bots are hidden");
+        assert!(app.unread_prs.contains("o/r#1"));
+        press(&mut app, KeyCode::Enter); // opens #1 in the PR list
+        assert_eq!(app.unread.len(), 1);
+        assert!(!app.unread_prs.contains("o/r#1"));
+        press(&mut app, KeyCode::Char('5'));
+        assert_eq!(app.list().view.len(), 3);
+        press(&mut app, KeyCode::Char('B'));
+        assert_eq!((app.list().view.len(), app.unread.len()), (4, 2));
+        press(&mut app, KeyCode::Char('S'));
+        assert!(app.unread.is_empty());
+        assert_eq!(config::load_seen(&path).unwrap().len(), 4);
+        // Seen ones stay seen, new ones are new.
+        app.feed(
+            Tab::Activity,
+            false,
+            events(&[("new", 1, false), ("a", 1, false)]),
+        );
+        assert_eq!(app.unread.len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_event_acts_on_its_pull_request_and_opens_the_discussion() {
+        let mut app = app();
+        app.feed(
+            Tab::Activity,
+            false,
+            events(&[("a", 7, false), ("b", 8, false)]),
+        );
+        press(&mut app, KeyCode::Char('5'));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.current().unwrap().id(), "o/r#8");
+        press(&mut app, KeyCode::Char('c'));
+        let Some(Modal::Form(form)) = app.modal.take() else {
+            panic!("no form");
+        };
+        assert_eq!(form.title, "Comment on o/r#8");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.detail_focus);
+        let source = reviewing().source;
+        app.feed_doc(false, Ok(source));
+        assert_eq!(app.doc.thread_at_cursor(), Some(0));
+    }
+
+    #[test]
+    fn activity_waits_for_login_and_teams() {
+        let mut app = app(); // has a repository, so other lists do not wait
+        app.load(Tab::Activity, false);
+        assert!(app.lists[4].waiting);
+        app.handle(Msg::Repos(Ok((Repos::default(), None))));
+        assert!(app.lists[4].waiting);
+        app.handle(Msg::Teams(Ok(Vec::new())));
+        assert!(!app.lists[4].waiting && app.lists[4].loading);
     }
 }

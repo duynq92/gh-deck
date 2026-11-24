@@ -1,3 +1,4 @@
+mod activity;
 mod ai;
 mod api;
 mod app;

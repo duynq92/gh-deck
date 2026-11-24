@@ -1,5 +1,6 @@
 //! Drawing. Every label that has a shortcut shows it.
 
+use crate::activity::Event;
 use crate::api::{self, Choice, Item, Reviews};
 use crate::app::{App, Modal, Picker, Status};
 use crate::doc::{GUTTER, Kind as LineKind, Visible, clean};
@@ -100,6 +101,8 @@ fn draw_body(frame: &mut Frame, app: &mut App, body: Rect) {
     let split = if app.tab == Tab::Prs && body.width >= 120 {
         // Reading the changes matters most.
         Layout::horizontal([Constraint::Ratio(1, 3), Constraint::Fill(1)])
+    } else if app.tab == Tab::Activity && body.width >= 120 {
+        Layout::horizontal([Constraint::Percentage(42), Constraint::Fill(1)])
     } else if body.width >= 180 {
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
     } else if body.height >= 24 {
@@ -123,7 +126,7 @@ enum TabSize {
     Full,
     Short,
     Tiny,
-    /// Only the keys, to make room for a message.
+    /// Only the keys of the other tabs.
     Keys,
 }
 
@@ -165,11 +168,16 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let tabs = |size: TabSize| {
         let mut spans = Vec::new();
         for (i, tab) in Tab::ALL.into_iter().enumerate() {
+            let new = match (tab, app.unread.len()) {
+                (Tab::Activity, n) if n > 0 => format!("({n}) "),
+                _ => String::new(),
+            };
             let name = match size {
-                TabSize::Full => format!(" {} ", tab.title()),
-                TabSize::Short => format!(" {} ", tab.short()),
+                TabSize::Full => format!(" {} {new}", tab.title()),
+                TabSize::Short => format!(" {} {new}", tab.short()),
+                TabSize::Keys if tab != app.tab && !new.is_empty() => new,
                 TabSize::Keys if tab != app.tab => " ".to_string(),
-                TabSize::Tiny | TabSize::Keys => format!("{} ", tab.tiny()),
+                TabSize::Tiny | TabSize::Keys => format!("{} {new}", tab.tiny()),
             };
             let style = if tab == app.tab {
                 Style::new()
@@ -205,13 +213,13 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         (TabSize::Short, " ", 12),
         (TabSize::Tiny, " ", 4),
         (TabSize::Tiny, "", 1),
+        (TabSize::Keys, "", 1),
     ];
     let message = status(app);
     // Long messages are cut; a readable part must stay in the center.
     let room = message.as_ref().map_or(0, |m| m.0.width().min(40) + 2);
     let mut best = (tabs(TabSize::Tiny), right(" ", 1));
-    let keys_only = message.is_some().then_some((TabSize::Keys, "", 1));
-    'fit: for (size, gap, min) in sizes.into_iter().chain(keys_only) {
+    'fit: for (size, gap, min) in sizes {
         for longest in (min..=40).rev() {
             let (l, r) = (tabs(size), right(gap, longest));
             let fits = l.width() + r.width() + room < width;
@@ -242,7 +250,9 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut block = pane(!app.detail_focus && app.modal.is_none());
     let list = app.list();
-    let count = if !list.find.is_empty() {
+    let count = if app.tab == Tab::Activity && list.find.is_empty() {
+        list.view.len().to_string() // without hidden bots
+    } else if !list.find.is_empty() {
         format!("{}/{}", list.view.len(), list.items.len())
     } else if list.cursor.is_some() || list.total > list.items.len() {
         format!("{} of {}", list.items.len(), list.total)
@@ -304,7 +314,11 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
         .skip(list.top)
         .take(height)
         .map(|(n, &i)| {
-            let line = columns.row(&list.items[i]);
+            let unread = match &list.items[i] {
+                Item::Event(e) => app.unread.contains(&e.key),
+                item => app.tab == Tab::Prs && app.unread_prs.contains(&item.id()),
+            };
+            let line = columns.row(&list.items[i], unread);
             if n == list.sel { selected(line) } else { line }
         })
         .collect();
@@ -339,6 +353,20 @@ impl Columns {
         let ticket = matches!(tab, Tab::Prs | Tab::Issues);
         if tab == Tab::Prs {
             return Columns::pull_requests(width, scoped);
+        }
+        if tab == Tab::Activity {
+            let mut c = Columns {
+                state: 1,
+                repo: if scoped { 0 } else { (width / 7).min(14) },
+                id: 6,
+                checks: 0,
+                title: 0,
+                reviewers: 0,
+                approval: 0,
+                date: if width >= 60 { 11 } else { 0 },
+            };
+            c.title = width.saturating_sub(c.used());
+            return c;
         }
         let mut c = Columns {
             state: if ticket { 6 } else { 11 },
@@ -418,11 +446,25 @@ impl Columns {
         };
         let mut spans = Vec::new();
         for (name, width) in [
-            (if self.state > 1 { "STATE" } else { "S" }, self.state),
+            (
+                match self.state {
+                    _ if tab == Tab::Activity => "",
+                    1 => "S",
+                    _ => "STATE",
+                },
+                self.state,
+            ),
             ("REPO", self.repo),
             (id, self.id),
             ("C", self.checks),
-            ("TITLE", self.title),
+            (
+                if tab == Tab::Activity {
+                    "WHAT HAPPENED"
+                } else {
+                    "TITLE"
+                },
+                self.title,
+            ),
             ("REVIEWERS", self.reviewers),
             (
                 if self.approval > 1 { "APPROVAL" } else { "A" },
@@ -435,12 +477,36 @@ impl Columns {
         Line::from(spans)
     }
 
-    fn row(&self, item: &Item) -> Line<'static> {
+    fn event(&self, e: &Event, unread: bool) -> Line<'static> {
+        let number = match &*e.pr {
+            Item::Ticket(t) => format!("#{}", t.number),
+            _ => String::new(),
+        };
+        let repo = e.pr.repo().split('/').next_back().unwrap_or("");
+        let style = match unread {
+            true => mark_style(&e.text).add_modifier(Modifier::BOLD),
+            false => DIM,
+        };
+        let date = api::date(&e.at);
+        let mut s = Vec::new();
+        cell(&mut s, if unread { "●" } else { " " }, self.state, KEY);
+        cell(&mut s, repo, self.repo, Style::new().fg(Color::Blue));
+        cell(&mut s, &number, self.id, Style::new().fg(ACCENT));
+        cell(&mut s, &e.text, self.title, style);
+        cell(&mut s, date.get(5..).unwrap_or(""), self.date, DIM);
+        Line::from(s)
+    }
+
+    fn row(&self, item: &Item, unread: bool) -> Line<'static> {
+        if let Item::Event(e) = item {
+            return self.event(e, unread);
+        }
         let state = item.state();
         let repo = item.repo().split('/').next_back().unwrap_or("");
         let (id, title) = match item {
             Item::Ticket(t) => (format!("#{}", t.number), t.title.clone()),
             Item::Release(r) => (r.tag.clone(), item.title().to_string()),
+            Item::Event(e) => (String::new(), e.text.clone()),
             Item::Run(r) => (
                 r.name.clone().unwrap_or_default(),
                 format!("{} ({})", r.title, r.branch.as_deref().unwrap_or("-")),
@@ -459,7 +525,13 @@ impl Columns {
         cell(&mut s, &id, self.id, Style::new().fg(ACCENT));
         let (mark, style) = check_mark(reviews.and_then(|r| r.checks.as_deref()));
         cell(&mut s, mark, self.checks, style);
-        cell(&mut s, &title, self.title, Style::new());
+        // Something new since it was opened last.
+        if unread && self.title > 2 {
+            s.push(Span::styled("● ", KEY));
+            cell(&mut s, &title, self.title - 2, BOLD);
+        } else {
+            cell(&mut s, &title, self.title, Style::new());
+        }
         if self.reviewers > 0 {
             reviewer_cell(&mut s, reviews, self.reviewers);
         }
@@ -491,6 +563,8 @@ fn mark_style(text: &str) -> Style {
         Some('✓') => Style::new().fg(Color::Green),
         Some('✗') => Style::new().fg(Color::Red),
         Some('●') => Style::new().fg(Color::Yellow),
+        Some('◆' | '@') => Style::new().fg(Color::Magenta),
+        Some('↑' | '⇡' | '○') => Style::new().fg(Color::Cyan),
         _ => DIM,
     }
 }
@@ -765,16 +839,18 @@ fn group_color(group: &Group) -> Color {
         "My PR" => Color::Yellow,
         "Teams" => Color::Cyan,
         "AI" => Color::Indexed(177),
+        "Activity" => Color::Green,
         _ => Color::Gray,
     }
 }
 
 /// `[n/N] Next/prev file `, with the label that fits the selected item.
 fn action(app: &App, name: &str, k: &Key, color: Color) -> [Span<'static>; 2] {
-    let label = match (k.act, app.list().selected().map(Item::state)) {
+    let label = match (k.act, app.current().map(Item::state)) {
         (Act::Toggle, Some("open" | "draft")) => "Close",
         (Act::Toggle, Some("closed")) => "Reopen",
         (Act::Raw, _) if app.raw => "Rendered",
+        (Act::Bots, _) if app.list().bots => "Hide bots",
         _ => k.label,
     };
     let count = match (k.act, app.excluded.len()) {
@@ -881,7 +957,7 @@ fn draw_menu(frame: &mut Frame, app: &App, sel: usize) {
         lines.push(Line::raw(""));
         lines.push(Line::from(spans));
     }
-    let item = app.list().selected().map(Item::id).unwrap_or_default();
+    let item = app.current().map(Item::id).unwrap_or_default();
     let block = pane(true)
         .title(Line::styled(format!(" Actions {} ", clean(&item)), BOLD))
         .title_bottom(hints(&[
@@ -978,7 +1054,7 @@ fn draw_help(frame: &mut Frame, tab: Tab) {
             lines.push(hints(row));
         }
     }
-    if tab == Tab::Prs {
+    if matches!(tab, Tab::Prs | Tab::Activity) {
         lines.push(Line::raw(
             " AI REVIEW  A start, Space accept, e edit, d discard, P post accepted",
         ));
@@ -1256,11 +1332,12 @@ mod tests {
                 80,
                 &[
                     "[1]PR",
-                    "[4]Act",
-                    "[o] Org:2",
-                    "[p] Repo:",
-                    "[f] Filter:3",
-                    "[s] State:",
+                    "[4]",
+                    "[5]",
+                    "[o]Org:2",
+                    "[p]Repo:",
+                    "[f]Filter:3",
+                    "[s]State:",
                 ][..],
             ),
             (
@@ -1387,6 +1464,21 @@ mod tests {
                         updated: "é".into(),
                         ..Ticket::default()
                     }),
+                    3 => Item::Event(crate::activity::Event {
+                        key: format!("k{n}"),
+                        text: text.into(),
+                        at: "é".into(),
+                        bot: n % 3 == 0,
+                        comment: Some(1),
+                        pr: Box::new(Item::Ticket(Ticket {
+                            repo: "ö/日本".into(),
+                            number: n % 4,
+                            head: "h".into(),
+                            body: text.into(),
+                            state: "OPEN".into(),
+                            ..Ticket::default()
+                        })),
+                    }),
                     1 => Item::Release(crate::api::Release {
                         repo: "o/r".into(),
                         tag: text.into(),
@@ -1464,6 +1556,7 @@ mod tests {
                     1 => app.feed(Tab::Issues, false, Ok(page(next(9).into(), 0))),
                     2 => app.feed(Tab::Releases, false, Ok(page(next(9).into(), 1))),
                     3 => app.feed(Tab::Runs, false, Ok(page(next(9).into(), 2))),
+                    41 => app.feed(Tab::Activity, false, Ok(page(next(20).into(), 3))),
                     4 => app.feed_doc(next(2) == 0, Ok(source(next(60) as usize))),
                     5 => app.feed_doc(next(2) == 0, Err(crate::gh::GhError(text.into()))),
                     6 => app.handle(Msg::Reviews(Ok(vec![Reviews {

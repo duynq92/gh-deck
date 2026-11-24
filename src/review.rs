@@ -228,7 +228,7 @@ pub fn post(
     parts.extend(batch.rest);
     if mention {
         parts.push(format!(
-            "_AI-assisted review ({}); every finding was checked by a person._",
+            "_AI-assisted review ({}); findings were accepted one by one before posting._",
             batch.tool
         ));
     }
