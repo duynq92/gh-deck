@@ -196,6 +196,8 @@ impl Picker {
 
 pub enum Modal {
     Help,
+    /// Position in `keys::menu`.
+    Menu(usize),
     Message(String),
     Confirm(Cmd),
     Form(Box<Form>),
@@ -224,6 +226,8 @@ pub struct App {
     pub modal: Option<Modal>,
     pub finding: bool,
     pub detail_focus: bool,
+    /// The focused document fills the screen.
+    pub zoom: bool,
     pub doc: Doc,
     pub doc_act: Act,
     /// Item the document belongs to.
@@ -260,6 +264,7 @@ impl App {
             modal: None,
             finding: false,
             detail_focus: false,
+            zoom: false,
             doc: Doc::default(),
             doc_act: Act::Info,
             doc_id: String::new(),
@@ -385,6 +390,7 @@ impl App {
             self.doc_job += 1; // ignore documents still in flight
             self.doc_loading = false;
             self.detail_focus = false;
+            self.zoom = false;
         } else if self.detail_focus || self.doc_loading {
             return;
         }
@@ -738,6 +744,7 @@ impl App {
     fn back(&mut self) {
         if self.detail_focus {
             self.detail_focus = false;
+            self.zoom = false;
             self.doc_loading = false;
             self.doc_job += 1;
             self.doc_act = Act::Info;
@@ -773,6 +780,7 @@ impl App {
     fn switch(&mut self, to: usize) {
         self.tab = Tab::ALL[to];
         self.detail_focus = false;
+        self.zoom = false;
         self.doc_act = Act::Info;
         self.sync_doc();
         if !self.list().loaded && !self.list().loading {
@@ -807,6 +815,14 @@ impl App {
         match act {
             Act::Quit => self.quit = true,
             Act::Help => self.modal = Some(Modal::Help),
+            Act::Menu => self.modal = Some(Modal::Menu(0)),
+            Act::Zoom => {
+                self.zoom = !self.zoom;
+                if self.zoom && !self.detail_focus {
+                    self.open_doc(Act::Info);
+                }
+                self.zoom &= self.detail_focus; // nothing is selected
+            }
             Act::Message => {
                 let text = self.last_message.clone();
                 self.modal = Some(Modal::Message(text.unwrap_or("no message yet".into())));
@@ -814,6 +830,7 @@ impl App {
             Act::Repo => self.pick_scope(),
             Act::Find => {
                 self.detail_focus = false;
+                self.zoom = false;
                 self.finding = true;
             }
             Act::Org => self.pick_org(),
@@ -1185,11 +1202,82 @@ impl App {
         }));
     }
 
+    /// Letters run an action at once; arrows and Enter choose one.
+    fn menu_key(&mut self, sel: usize, key: KeyEvent) {
+        let items = keys::menu(self.tab);
+        let last = items.len() - 1;
+        let group = items[sel].0;
+        let first_of = |g: usize| items.iter().position(|i| i.0 == g);
+        let to = match key.code {
+            KeyCode::Esc | KeyCode::Char('.') => return,
+            KeyCode::Enter => return self.act(items[sel].1.act),
+            KeyCode::Char(c) => match keys::lookup(self.tab, c) {
+                Some(act) => return self.act(act),
+                None => sel,
+            },
+            KeyCode::Right => (sel + 1).min(last),
+            KeyCode::Left => sel.saturating_sub(1),
+            KeyCode::Down => first_of(group + 1).unwrap_or(sel),
+            KeyCode::Up => group.checked_sub(1).and_then(first_of).unwrap_or(sel),
+            _ => sel,
+        };
+        self.modal = Some(Modal::Menu(to));
+    }
+
+    /// Whether an action makes sense for the selected item. Only a hint for the
+    /// labels: GitHub has the last word.
+    pub fn applies(&self, act: Act) -> bool {
+        let anytime = matches!(
+            act,
+            Act::Org
+                | Act::Repo
+                | Act::Filter
+                | Act::State
+                | Act::Exclude
+                | Act::Find
+                | Act::More
+                | Act::Refresh
+                | Act::Menu
+                | Act::Help
+                | Act::Message
+                | Act::Quit
+                | Act::New
+                | Act::Trigger
+        );
+        if anytime {
+            return true;
+        }
+        let Some(item) = self.list().selected() else {
+            return false;
+        };
+        let state = item.state();
+        let mine = self.is_mine(item);
+        match act {
+            Act::Reviewers => mine && matches!(state, "open" | "draft"),
+            Act::Title | Act::Description | Act::Tasks => mine,
+            Act::Ready => mine && state == "draft",
+            // GitHub does not let authors review their own pull request.
+            Act::Approve | Act::RequestChanges => {
+                matches!(state, "open" | "draft") && (!mine || self.repos.is_none())
+            }
+            Act::Merge => state == "open",
+            Act::Toggle => state != "merged",
+            Act::Publish => state == "draft",
+            Act::Cancel => matches!(item, Item::Run(r) if r.conclusion.is_none()),
+            Act::Log | Act::Rerun => matches!(item, Item::Run(r) if r.conclusion.is_some()),
+            Act::FailedLog | Act::RerunFailed => {
+                matches!(state, "failure" | "timed_out" | "startup_failure")
+            }
+            _ => true,
+        }
+    }
+
     /// The modal was taken out; put it back to keep it open.
     fn modal_key(&mut self, modal: Modal, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match modal {
             Modal::Help | Modal::Message(_) => {}
+            Modal::Menu(sel) => self.menu_key(sel, key),
             Modal::Confirm(cmd) => match key.code {
                 KeyCode::Char('y') => self.execute(cmd, None),
                 KeyCode::Char('n') | KeyCode::Esc => {}
@@ -1635,5 +1723,63 @@ mod tests {
         app.modal = None;
         app.pick_tasks("o/r".into(), 7, "no boxes".into());
         assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn menu_runs_by_letter_or_arrows() {
+        let mut app = app();
+        app.listed(Tab::Prs, 0, false, page(&[1]));
+        for code in [KeyCode::Char('.'), KeyCode::Char('c')] {
+            press(&mut app, code);
+        }
+        assert!(matches!(&app.modal, Some(Modal::Form(f)) if f.act == Act::Comment));
+        press(&mut app, KeyCode::Esc);
+        // Down to Review, right to Request changes.
+        for code in [
+            KeyCode::Char('.'),
+            KeyCode::Down,
+            KeyCode::Right,
+            KeyCode::Enter,
+        ] {
+            press(&mut app, code);
+        }
+        assert!(matches!(&app.modal, Some(Modal::Form(f)) if f.act == Act::RequestChanges));
+        press(&mut app, KeyCode::Esc);
+        for code in [KeyCode::Char('.'), KeyCode::Char('Z')] {
+            press(&mut app, code); // unknown letters keep it open
+        }
+        assert!(matches!(app.modal, Some(Modal::Menu(0))));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn menu_arrows_stay_in_range() {
+        let mut app = app();
+        for tab in Tab::ALL {
+            app.tab = tab;
+            app.modal = Some(Modal::Menu(0));
+            for code in [KeyCode::Up, KeyCode::Left, KeyCode::Down, KeyCode::Right] {
+                for _ in 0..60 {
+                    press(&mut app, code);
+                }
+                assert!(matches!(app.modal, Some(Modal::Menu(_))), "{tab:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn zoom_follows_the_document() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('z'));
+        assert!(!app.zoom); // nothing selected
+        app.listed(Tab::Prs, 0, false, page(&[1]));
+        press(&mut app, KeyCode::Char('z'));
+        assert!(app.zoom && app.detail_focus);
+        press(&mut app, KeyCode::Char('z'));
+        assert!(!app.zoom && app.detail_focus);
+        press(&mut app, KeyCode::Char('z'));
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.zoom && !app.detail_focus);
     }
 }

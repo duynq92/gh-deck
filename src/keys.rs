@@ -50,6 +50,8 @@ pub enum Act {
     Find,
     More,
     Refresh,
+    Zoom,
+    Menu,
     Help,
     Message,
     Quit,
@@ -137,6 +139,8 @@ pub const GLOBAL: Group = Group {
         k('/', "Find", Act::Find),
         k('>', "More", Act::More),
         k('R', "Refresh", Act::Refresh),
+        k('z', "Zoom", Act::Zoom),
+        k('.', "All actions", Act::Menu),
         k('?', "Help", Act::Help),
         k('!', "Message", Act::Message),
         k('q', "Quit", Act::Quit),
@@ -254,6 +258,75 @@ pub fn groups(tab: Tab) -> &'static [Group] {
         Tab::Issues => ISSUES,
         Tab::Releases => RELEASES,
         Tab::Runs => RUNS,
+    }
+}
+
+/// Every group of a tab, in the order of the actions popup.
+pub fn all(tab: Tab) -> impl Iterator<Item = &'static Group> {
+    groups(tab).iter().chain([&SCOPE, &GLOBAL])
+}
+
+/// Actions of the popup, with the position of their group.
+pub fn menu(tab: Tab) -> Vec<(usize, &'static Key)> {
+    let in_group = |(n, g): (usize, &'static Group)| g.keys.iter().map(move |k| (n, k));
+    let keys = all(tab).enumerate().flat_map(in_group);
+    keys.filter(|(_, k)| k.act != Act::Menu).collect()
+}
+
+/// The actions worth a place in the one-line footer, most useful first.
+pub fn footer(tab: Tab, reading: bool) -> &'static [Act] {
+    use Act::*;
+    match (tab, reading) {
+        (Tab::Prs, true) => &[
+            NextFile,
+            Zoom,
+            Approve,
+            RequestChanges,
+            Comment,
+            Ready,
+            Merge,
+            Diff,
+            Info,
+            Checks,
+            Description,
+            Tasks,
+            Web,
+        ],
+        (Tab::Prs, false) => &[
+            Approve,
+            RequestChanges,
+            Comment,
+            Reviewers,
+            Ready,
+            Merge,
+            Title,
+            Description,
+            Tasks,
+            Find,
+            Checks,
+            Checkout,
+            Exclude,
+            Zoom,
+            Web,
+        ],
+        (Tab::Issues, _) => &[
+            Comment, New, Labels, Assignees, Toggle, Find, Zoom, Web, More, Refresh,
+        ],
+        (Tab::Releases, _) => &[
+            New, Edit, Publish, Download, Delete, Find, Zoom, Web, Refresh,
+        ],
+        (Tab::Runs, _) => &[
+            Log,
+            FailedLog,
+            Rerun,
+            RerunFailed,
+            Cancel,
+            Trigger,
+            Find,
+            Zoom,
+            Web,
+            Refresh,
+        ],
     }
 }
 

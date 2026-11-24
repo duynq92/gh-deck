@@ -4,7 +4,7 @@ use crate::api::{self, Choice, Item, Reviews};
 use crate::app::{App, Modal, Picker, Status};
 use crate::doc::{GUTTER, Kind as LineKind, clean};
 use crate::form::{Form, Kind, line_at};
-use crate::keys::{self, Act, GLOBAL, Group, SCOPE, Tab};
+use crate::keys::{self, Act, Group, Key, SCOPE, Tab};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -70,28 +70,20 @@ fn fit(text: &str, width: usize) -> String {
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let screen = frame.area();
-    let rows = flow(app, screen.width, 2);
-    // Boxes when they leave enough room for content, one-line groups otherwise.
-    let boxed = rows.len() as u16 * 3 <= screen.height / 4;
-    let rows = if boxed {
-        rows
-    } else {
-        flow(app, screen.width, 0)
-    };
-    let height = rows.len() as u16 * if boxed { 3 } else { 1 };
-    let [header, body, bar] = Layout::vertical([
+    let [header, body, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(3),
-        Constraint::Length(height),
+        Constraint::Length(1),
     ])
     .areas(screen);
 
     draw_header(frame, app, header);
     draw_body(frame, app, body);
-    draw_actions(frame, app, bar, &rows, boxed);
+    frame.render_widget(footer_line(app, footer.width as usize), footer);
 
     match &app.modal {
         Some(Modal::Help) => draw_help(frame, app.tab),
+        Some(Modal::Menu(sel)) => draw_menu(frame, app, *sel),
         Some(Modal::Message(text)) => draw_message(frame, text),
         Some(Modal::Confirm(cmd)) => draw_confirm(frame, &cmd.label),
         Some(Modal::Form(form)) => draw_form(frame, form),
@@ -101,6 +93,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 fn draw_body(frame: &mut Frame, app: &mut App, body: Rect) {
+    if app.zoom && app.detail_focus {
+        return draw_doc(frame, app, body);
+    }
     let split = if app.tab == Tab::Prs && body.width >= 120 {
         // Reading the changes matters most.
         Layout::horizontal([Constraint::Ratio(1, 3), Constraint::Fill(1)])
@@ -706,141 +701,99 @@ fn group_color(group: &Group) -> Color {
     }
 }
 
-type Placed = (&'static Group, u16);
+/// `[n/N] Next/prev file `, with the label that fits the selected item.
+fn action(app: &App, name: &str, k: &Key, color: Color) -> [Span<'static>; 2] {
+    let label = match (k.act, app.list().selected().map(Item::state)) {
+        (Act::Toggle, Some("open" | "draft")) => "Close",
+        (Act::Toggle, Some("closed")) => "Reopen",
+        _ => k.label,
+    };
+    let count = match (k.act, app.excluded.len()) {
+        (Act::Exclude, n) if n > 0 => format!(" ({n})"),
+        _ => String::new(),
+    };
+    // Red marks what is hard to undo.
+    let risky = matches!(
+        k.act,
+        Act::Merge | Act::Toggle | Act::Delete | Act::Cancel | Act::Publish
+    );
+    let color = if risky { Color::Red } else { color };
+    let style = Style::new().fg(color).add_modifier(Modifier::BOLD);
+    [
+        Span::styled(format!("[{name}]"), style),
+        Span::raw(format!(" {label}{count} ")),
+    ]
+}
 
-/// Put the action groups on as few rows as possible. Their order changes only
-/// when that saves a row or keeps General from standing alone.
-fn flow(app: &App, width: u16, border: usize) -> Vec<Vec<Placed>> {
-    let mut groups: Vec<Placed> = keys::groups(app.tab)
-        .iter()
-        .chain([&GLOBAL])
-        .map(|group| {
-            let title = if border > 0 { 0 } else { group.name.len() + 3 };
-            let keys: usize = key_spans(app, group).iter().map(Span::width).sum();
-            (group, (keys + title + border) as u16)
+/// What is useful right now, as far as it fits; the popup has the rest.
+fn footer_line(app: &App, width: usize) -> Line<'static> {
+    let find = |act: Act| {
+        keys::all(app.tab).find_map(|g| {
+            let (name, k) = g.shown().find(|(_, k)| k.act == act)?;
+            Some(action(app, &name, k, group_color(g)))
         })
+    };
+    let len = |spans: &[Span]| spans.iter().map(Span::width).sum::<usize>();
+    let end: Vec<Span> = [Act::Menu, Act::Help]
+        .into_iter()
+        .filter_map(find)
+        .flatten()
         .collect();
-    let mut best = fill(&groups, width);
-    let mut cost = waste(&best);
-    permute(&mut groups, 0, &mut |order| {
-        let rows = fill(order, width);
-        let new = waste(&rows);
-        if new < cost {
-            (best, cost) = (rows, new);
+    let mut spans = vec![Span::raw(" ")];
+    let acts = keys::footer(app.tab, app.detail_focus).iter().copied();
+    for part in acts.filter(|a| app.applies(*a)).filter_map(find) {
+        if len(&spans) + len(&part) + len(&end) > width {
+            break;
         }
-    });
-    // General always comes last.
-    let general = |g: &Placed| g.0.name == GLOBAL.name;
-    best.sort_by_key(|row| row.iter().any(general));
-    for row in &mut best {
-        row.sort_by_key(general);
+        spans.extend(part);
     }
-    best
+    let gap = width.saturating_sub(len(&spans) + len(&end));
+    spans.push(Span::raw(" ".repeat(gap)));
+    spans.extend(end);
+    Line::from(spans)
 }
 
-fn fill(groups: &[Placed], width: u16) -> Vec<Vec<Placed>> {
-    let mut rows: Vec<Vec<Placed>> = Vec::new();
-    let mut used = 0;
-    for &(group, len) in groups {
-        match rows.last_mut() {
-            Some(row) if used + len <= width => row.push((group, len)),
-            _ => {
-                rows.push(vec![(group, len)]);
-                used = 0;
+fn draw_menu(frame: &mut Frame, app: &App, sel: usize) {
+    let chosen = keys::menu(app.tab).get(sel).map(|i| i.1.act);
+    let mut lines = Vec::new();
+    for group in keys::all(app.tab) {
+        let color = group_color(group);
+        let badge = Style::new()
+            .fg(Color::Black)
+            .bg(color)
+            .add_modifier(Modifier::BOLD);
+        let mut spans = vec![
+            Span::styled(format!(" {:<7} ", group.name), badge),
+            Span::raw(" "),
+        ];
+        for (name, k) in group.shown().filter(|(_, k)| k.act != Act::Menu) {
+            let here =
+                chosen == Some(k.act) || (chosen == Some(Act::PrevFile) && k.act == Act::NextFile);
+            for mut span in action(app, &name, k, color) {
+                if !app.applies(k.act) {
+                    span.style = DIM;
+                }
+                if here {
+                    span.style = span.style.add_modifier(Modifier::REVERSED);
+                }
+                spans.push(span);
             }
         }
-        used += len;
+        lines.push(Line::raw(""));
+        lines.push(Line::from(spans));
     }
-    rows
-}
-
-/// Rows, then whether General is alone although there are other groups.
-fn waste(rows: &[Vec<Placed>]) -> (usize, bool) {
-    let alone = |row: &Vec<Placed>| row.len() == 1 && row[0].0.name == GLOBAL.name;
-    (rows.len(), rows.iter().any(alone))
-}
-
-/// Visit every order; there are at most six groups.
-fn permute(groups: &mut [Placed], from: usize, visit: &mut impl FnMut(&[Placed])) {
-    if from == groups.len() {
-        return visit(groups);
-    }
-    for i in from..groups.len() {
-        // Rotating, unlike swapping, keeps the rest in their usual order.
-        groups[from..=i].rotate_right(1);
-        permute(groups, from + 1, visit);
-        groups[from..=i].rotate_left(1);
-    }
-}
-
-fn draw_actions(frame: &mut Frame, app: &App, area: Rect, rows: &[Vec<Placed>], boxed: bool) {
-    let height = if boxed { 3 } else { 1 };
-    let mut y = area.y;
-    for row in rows {
-        let mut x = area.x;
-        for (group, len) in row {
-            let color = group_color(group);
-            let place = Rect::new(x, y, *len, height).intersection(area);
-            x = x.saturating_add(*len);
-            if boxed {
-                let block = Block::bordered()
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::new().fg(color))
-                    .title(Line::styled(
-                        format!(" {} ", group.name),
-                        Style::new().fg(color).add_modifier(Modifier::BOLD),
-                    ));
-                let inner = block.inner(place);
-                frame.render_widget(block, place);
-                frame.render_widget(Line::from(key_spans(app, group)), inner);
-            } else {
-                let badge = Style::new()
-                    .fg(Color::Black)
-                    .bg(color)
-                    .add_modifier(Modifier::BOLD);
-                let mut spans = vec![
-                    Span::styled(format!(" {} ", group.name), badge),
-                    Span::raw(" "),
-                ];
-                spans.extend(key_spans(app, group));
-                frame.render_widget(Line::from(spans), place);
-            }
-        }
-        y += height;
-    }
-}
-
-fn key_spans(app: &App, group: &Group) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    for (name, k) in group.shown() {
-        let label = match (k.act, app.list().selected().map(Item::state)) {
-            (Act::Toggle, Some("open" | "draft")) => "Close",
-            (Act::Toggle, Some("closed")) => "Reopen",
-            _ => k.label,
-        };
-        // Red marks what is hard to undo.
-        let risky = matches!(
-            k.act,
-            Act::Merge | Act::Toggle | Act::Delete | Act::Cancel | Act::Publish
-        );
-        let off = app.list().selected().is_some_and(|item| match k.act {
-            Act::Reviewers | Act::Title | Act::Description | Act::Tasks => !app.is_mine(item),
-            Act::Ready => !app.is_mine(item) || item.state() != "draft",
-            _ => false,
-        });
-        if off {
-            spans.push(Span::styled(format!("[{name}] {label} "), DIM));
-            continue;
-        }
-        let count = match (k.act, app.excluded.len()) {
-            (Act::Exclude, n) if n > 0 => format!(" ({n})"),
-            _ => String::new(),
-        };
-        let style = if risky { KEY.fg(Color::Red) } else { KEY };
-        spans.push(Span::styled(format!("[{name}]"), style));
-        spans.push(Span::raw(format!(" {label}{count} ")));
-    }
-    spans
+    let item = app.list().selected().map(Item::id).unwrap_or_default();
+    let block = pane(true)
+        .title(Line::styled(format!(" Actions {} ", clean(&item)), BOLD))
+        .title_bottom(hints(&[
+            ("letter", "Run"),
+            ("←↑↓→", "Move"),
+            ("Enter", "Run selected"),
+            ("Esc", "Close"),
+        ]));
+    let width = lines.iter().map(Line::width).max().unwrap_or(0) as u16 + 2;
+    let inner = popup(frame, width.max(60), lines.len() as u16 + 3, block);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Text and style of the current message.
@@ -913,7 +866,7 @@ fn draw_help(frame: &mut Frame, tab: Tab) {
     let mut more = vec![Span::raw("          ")];
     more.extend(hints(&navigation[3..]).spans);
     lines.push(Line::from(more));
-    for group in keys::groups(tab).iter().chain([&SCOPE, &GLOBAL]) {
+    for group in keys::groups(tab).iter().chain([&SCOPE, &keys::GLOBAL]) {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
             format!(" {}", group.name.to_uppercase()),
@@ -1136,23 +1089,20 @@ mod tests {
     }
 
     #[test]
-    fn every_shortcut_is_visible_at_80x24() {
+    fn popup_has_every_shortcut_at_80x24() {
         let mut app = App::new(mpsc::channel().0, None);
         for tab in Tab::ALL {
             app.tab = tab;
             let text = screen(&mut app, 80, 24);
-            assert!(
-                text.contains("Org:All") && text.contains("Repo:All"),
-                "{tab:?}"
-            );
-            for group in keys::groups(tab).iter().chain([&GLOBAL]) {
-                for (name, k) in group.shown() {
-                    assert!(
-                        text.contains(&format!("[{name}] {}", k.label)),
-                        "{tab:?} {}",
-                        k.label
-                    );
-                }
+            for part in ["Org:All", "Repo:All", "[.] All actions", "[?] Help"] {
+                assert!(text.contains(part), "{tab:?} {part}");
+            }
+            app.modal = Some(Modal::Menu(0));
+            let text = screen(&mut app, 80, 24);
+            app.modal = None;
+            for (name, k) in keys::all(tab).flat_map(Group::shown) {
+                let shown = text.contains(&format!("[{name}] {}", k.label));
+                assert!(shown, "{tab:?} {}", k.label);
             }
         }
     }
@@ -1269,21 +1219,22 @@ mod tests {
     }
 
     #[test]
-    fn general_shares_a_row() {
+    fn footer_fits_and_hides_what_does_not_apply() {
         let mut app = App::new(mpsc::channel().0, None);
         for tab in Tab::ALL {
             app.tab = tab;
-            let count = keys::groups(tab).len() + 1;
-            for width in (120..=240).step_by(5) {
-                let rows = flow(&app, width, 2);
-                assert!(!waste(&rows).1, "{tab:?} {width}");
-                assert_eq!(rows.iter().map(Vec::len).sum::<usize>(), count);
-                for row in rows {
-                    assert!(row.iter().map(|g| g.1).sum::<u16>() <= width);
+            for reading in [false, true] {
+                app.detail_focus = reading;
+                for width in 40..200 {
+                    assert!(footer_line(&app, width).width() <= width, "{tab:?} {width}");
                 }
+                // Nothing is selected.
+                let text = footer_line(&app, 200).to_string();
+                assert!(
+                    !text.contains("Merge") && !text.contains("Delete"),
+                    "{text}"
+                );
             }
         }
-        app.tab = Tab::Prs;
-        assert_eq!(flow(&app, 150, 2).len(), 2);
     }
 }
