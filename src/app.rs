@@ -253,6 +253,8 @@ pub struct App {
     /// What the running AI review is about.
     pub ai_running: Option<String>,
     ai_job: u64,
+    /// Action that runs when the changes are loaded.
+    pending: Option<Act>,
     /// Findings by item, only until the app ends.
     reviews: HashMap<String, Review>,
     /// A repository was given on the command line: do not save it.
@@ -306,6 +308,7 @@ impl App {
             ai_path: None,
             ai_running: None,
             ai_job: 0,
+            pending: None,
             reviews: HashMap::new(),
             fixed,
             modal: None,
@@ -490,6 +493,7 @@ impl App {
         }
         if id != self.doc_id {
             self.doc_job += 1; // ignore documents still in flight
+            self.pending = None;
             self.doc_loading = false;
             self.detail_focus = false;
             self.zoom = false;
@@ -671,6 +675,16 @@ impl App {
                         if let Some(mark) = mark {
                             self.doc.layout(width);
                             self.doc.seek(&mark, height);
+                        }
+                        if let Some(act) = self.pending.take() {
+                            // Not again: it would load forever.
+                            if self.source.diff.is_some() {
+                                self.status = None;
+                                self.doc.layout(width);
+                                self.act(act);
+                            } else {
+                                self.error("the changes are not available");
+                            }
                         }
                     }
                     Err(e) if refresh => self.error(e),
@@ -957,6 +971,7 @@ impl App {
         if self.detail_focus {
             self.detail_focus = false;
             self.zoom = false;
+            self.pending = None;
             self.doc_loading = false;
             self.doc_job += 1;
             self.doc_act = Act::Info;
@@ -1264,14 +1279,21 @@ impl App {
         }
     }
 
+    /// Run an action once the changes are there, loading them if needed.
+    fn when_loaded(&mut self, act: Act, open: Act) {
+        if !self.doc_loading {
+            self.open_doc(open);
+        }
+        if self.doc_loading {
+            self.pending = Some(act);
+            self.info("loading the changes…");
+        }
+    }
+
     /// Start line mode, or say why not.
     fn start_lines(&mut self) {
         if !self.doc.has_files() {
-            if self.doc_loading {
-                return self.info("still loading");
-            }
-            self.open_doc(Act::Diff);
-            return self.info("press l again when the changes are loaded");
+            return self.when_loaded(Act::Lines, Act::Diff);
         }
         self.detail_focus = true;
         let height = self.doc_height;
@@ -1282,10 +1304,12 @@ impl App {
 
     fn jump_thread(&mut self, forward: bool) {
         if !self.doc.has_files() && !self.doc.has_threads() {
-            if !self.doc_loading {
-                self.open_doc(Act::Diff);
-            }
-            return self.info("press u again when the changes are loaded");
+            let act = if forward {
+                Act::NextThread
+            } else {
+                Act::PrevThread
+            };
+            return self.when_loaded(act, Act::Diff);
         }
         self.detail_focus = true;
         let height = self.doc_height;
@@ -1392,10 +1416,7 @@ impl App {
         };
         let repo = t.repo.clone();
         if self.source.diff.is_none() || self.source.oid.is_empty() {
-            if !self.doc_loading {
-                self.open_doc(Act::Info);
-            }
-            return self.info("press A again when the changes are loaded");
+            return self.when_loaded(Act::Ai, Act::Info);
         }
         if self.ai.blocks(&repo) {
             return self.error(format!("{repo} is blocked in ai.json"));
@@ -2881,5 +2902,38 @@ mod tests {
         press(&mut app, KeyCode::Char('j'));
         press(&mut app, KeyCode::Char(' '));
         assert!(app.doc.anchor.is_some());
+    }
+
+    #[test]
+    fn one_press_is_enough_before_the_changes_are_loaded() {
+        let loaded = |diff: Option<&str>| Source {
+            diff: diff.map(String::from),
+            oid: "abc".into(),
+            ..Source::default()
+        };
+        let diff = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n";
+        let mut app = app();
+        app.listed(Tab::Prs, 0, false, page(&[1, 2]));
+        app.ai.tool = Some(Tool::Claude);
+        press(&mut app, KeyCode::Char('A'));
+        assert!(app.ai_running.is_none() && app.doc_loading);
+        app.feed_doc(false, Ok(loaded(Some(diff))));
+        assert!(app.ai_running.take().is_some());
+        // Another item, and Esc, forget it.
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('A'));
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Enter);
+        app.feed_doc(false, Ok(loaded(Some(diff))));
+        assert!(app.ai_running.is_none());
+        // Without changes it ends with a message, not in a loop.
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('l'));
+        app.feed_doc(false, Ok(loaded(None)));
+        assert!(!app.doc_loading && app.doc.cursor.is_none());
+        press(&mut app, KeyCode::Char('l'));
+        app.feed_doc(false, Ok(loaded(Some(diff))));
+        assert!(app.doc.cursor.is_some());
     }
 }
