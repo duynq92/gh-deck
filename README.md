@@ -5,13 +5,24 @@ Actions, across all your repositories. Every label shows its shortcut.
 
 ## Install
 
-Requires Rust 1.90+ and a signed-in [GitHub CLI](https://cli.github.com) (`gh auth login`).
+Requires a signed-in [GitHub CLI](https://cli.github.com) (`gh auth login`) with
+access to this repository. macOS and Linux:
 
 ```sh
-cargo install --path . --locked
-ghdeck              # all your repositories
-ghdeck owner/repo   # one repository
+gh extension install duynq92/gh-deck
+gh deck              # all your repositories
+gh deck owner/repo   # one repository
+gh extension upgrade deck
 ```
+
+Or build the `ghdeck` command from source with Rust 1.90+:
+`cargo install --path . --locked`.
+
+## Release
+
+Set `version` in `Cargo.toml` (and run `cargo build` to update `Cargo.lock`), merge,
+then push a matching tag such as `v0.1.0`. The Release workflow builds and
+publishes the binaries.
 
 ## Keys
 
@@ -44,5 +55,5 @@ actions open a form that is only sent with `Ctrl+S`.
 - The Releases tab without a chosen repository shows the 3 newest releases of the
   50 most recently pushed ones.
 - The repository picker lists the 100 most recently pushed; use
-  `ghdeck owner/repo` for others.
+  `gh deck owner/repo` for others.
 - `b` checkout only works when ghdeck was started inside a clone of that repository.
