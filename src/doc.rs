@@ -324,8 +324,13 @@ impl Doc {
             for (i, c) in text.char_indices() {
                 let w = c.width().unwrap_or(0);
                 if used + w > width as usize {
+                    if words && c == ' ' {
+                        // A space at the edge stays there, out of sight.
+                        space = Some((offset + i + 1, used));
+                        continue;
+                    }
                     let (end, kept) = match space {
-                        Some((end, columns)) if words && c != ' ' => (end, used - columns),
+                        Some((end, columns)) if words => (end, used - columns),
                         _ => (offset + i, 0),
                     };
                     self.rows.push(row(start, end, n, continued));
@@ -640,6 +645,10 @@ deleted file mode 100644
         let source = Source::preview("T\n\n- one two three four");
         let mut doc = Doc::new(&source, false);
         assert_eq!(rows(&mut doc, 12), ["T", "", "• one two ", "  three four"]);
+        // The space after "two," is exactly past the edge.
+        let mut doc = Doc::new(&Source::preview("T\n\n- one two, three"), false);
+        let got = rows(&mut doc, 10);
+        assert_eq!(got[2..], ["• one two, ", "  three"]);
         let mut doc = Doc::new(&Source::plain("abcdefghij kl".into()), false);
         assert_eq!(rows(&mut doc, 4), ["abcd", "efgh", "ij ", "kl"]);
     }
