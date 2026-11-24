@@ -331,7 +331,8 @@ impl Render {
         let widths: Vec<usize> = (0..columns)
             .map(|c| {
                 let cells = rows.iter().filter_map(|r| r.get(c));
-                cells.map(|t| t.trim().width()).max().unwrap_or(0)
+                // One huge cell must not pad every other row to its width.
+                cells.map(|t| t.trim().width()).max().unwrap_or(0).min(60)
             })
             .collect();
         for (n, row) in rows.iter().enumerate() {
@@ -342,7 +343,7 @@ impl Render {
                 }
                 self.styled(if n == 0 { BOLD } else { 0 }, cell);
                 if c + 1 < columns {
-                    self.push(&" ".repeat(width - cell.width()));
+                    self.push(&" ".repeat(width.saturating_sub(cell.width())));
                 }
             }
             self.flush();
@@ -508,5 +509,13 @@ mod tests {
         ] {
             render(source);
         }
+    }
+
+    #[test]
+    fn a_huge_cell_does_not_blow_up_the_table() {
+        let mut source = format!("| {} | b |\n|---|---|\n", "x".repeat(20_000));
+        source.push_str(&"| a | b |\n".repeat(3_000));
+        let size: usize = render(&source).iter().map(|l| l.text.len()).sum();
+        assert!(size < 1_000_000, "{size}");
     }
 }

@@ -378,6 +378,9 @@ impl App {
     }
 
     fn spawn(&mut self, work: impl FnOnce() -> Msg + Send + 'static) {
+        if cfg!(test) {
+            return; // tests never run `gh`: keys could change real pull requests
+        }
         let tx = self.tx.clone();
         let spawned = thread::Builder::new().stack_size(256 << 10).spawn(move || {
             // Sending only fails when the app is already shutting down.
@@ -611,8 +614,8 @@ impl App {
                         // Line mode goes on: its keys mean something else outside.
                         let mark = self.doc.mark().map(|mark| match mark {
                             Mark::Thread(n) => {
-                                let id = &self.source.threads[n].id;
-                                let now = d.threads.iter().position(|t| &t.id == id);
+                                let id = self.source.threads.get(n).map(|t| &t.id);
+                                let now = d.threads.iter().position(|t| Some(&t.id) == id);
                                 Mark::Thread(now.unwrap_or(usize::MAX))
                             }
                             line => line,
@@ -1179,7 +1182,9 @@ impl App {
         }
         let repo = t.repo.clone();
         if let Some(mut form) = Form::new(Tab::Prs, Act::Merge, &repo, Some(item), "") {
-            form.fields[0].kind = form::Kind::Choice(ready.methods, 0);
+            if let Some(method) = form.fields.first_mut() {
+                method.kind = form::Kind::Choice(ready.methods, 0);
+            }
             form.notes = ready.notes;
             self.modal = Some(Modal::Form(Box::new(form)));
         }
@@ -1265,10 +1270,10 @@ impl App {
     }
 
     fn toggle_thread(&mut self) {
-        let Some(thread) = self.doc.thread_at_cursor() else {
+        let at = self.doc.thread_at_cursor();
+        let Some(thread) = at.and_then(|n| self.source.threads.get(n)) else {
             return self.info("move to a discussion first: u");
         };
-        let thread = &self.source.threads[thread];
         if thread.can_toggle {
             self.modal = Some(Modal::Confirm(review::toggle(thread)));
         } else {
@@ -1281,8 +1286,11 @@ impl App {
         let Some(item) = self.list().selected().cloned() else {
             return;
         };
-        let (act, extra, what) = if let Some(n) = self.doc.thread_at_cursor() {
-            let thread = &self.source.threads[n];
+        let (act, extra, what) = if let Some(thread) = self
+            .doc
+            .thread_at_cursor()
+            .and_then(|n| self.source.threads.get(n))
+        {
             let first = thread.comments.first().and_then(|c| c.id);
             match first {
                 Some(id) if thread.can_reply => (
@@ -1517,12 +1525,14 @@ impl App {
     /// Letters run an action at once; arrows and Enter choose one.
     fn menu_key(&mut self, sel: usize, key: KeyEvent) {
         let items = keys::menu(self.tab);
-        let last = items.len() - 1;
-        let group = items[sel].0;
+        let Some(&(group, chosen)) = items.get(sel) else {
+            return;
+        };
+        let last = items.len().saturating_sub(1);
         let first_of = |g: usize| items.iter().position(|i| i.0 == g);
         let to = match key.code {
             KeyCode::Esc | KeyCode::Char('.') => return,
-            KeyCode::Enter => return self.act(items[sel].1.act),
+            KeyCode::Enter => return self.act(chosen.act),
             KeyCode::Char(c) => match keys::lookup(self.tab, c) {
                 Some(act) => return self.act(act),
                 None => sel,
@@ -1749,6 +1759,9 @@ impl App {
 }
 
 fn open_url(url: &str) -> Result<()> {
+    if cfg!(test) {
+        return Ok(());
+    }
     if !url.starts_with("https://") {
         return Err(GhError(format!("refusing to open {url:?}")));
     }
@@ -1768,6 +1781,56 @@ fn open_url(url: &str) -> Result<()> {
         Ok(())
     } else {
         Err(GhError(format!("{opener} failed with {status}")))
+    }
+}
+
+/// Doors for tests that act like workers.
+#[cfg(test)]
+impl App {
+    pub fn feed(&mut self, tab: Tab, append: bool, result: Result<Page>) {
+        let job = self.lists[tab as usize].job;
+        self.listed(tab, job, append, result);
+    }
+
+    pub fn feed_doc(&mut self, refresh: bool, result: Result<Source>) {
+        let job = self.doc_job;
+        self.handle(Msg::Doc {
+            job,
+            bottom: false,
+            refresh,
+            result,
+        });
+    }
+
+    pub fn feed_pick(&mut self, people: Candidates, body: &str, ready: Readiness, which: u32) {
+        let job = self.pick_job;
+        let Some(item) = self.list().selected().cloned() else {
+            return;
+        };
+        let (repo, number) = ("o/r".to_string(), 7);
+        self.handle(match which {
+            0 => Msg::Reviewers {
+                job,
+                repo,
+                number,
+                result: Ok(people),
+            },
+            1 => Msg::Merge {
+                job,
+                item: Box::new(item),
+                result: Ok(ready),
+            },
+            _ => Msg::Text {
+                job,
+                act: [Act::Title, Act::Description, Act::Tasks][body.len() % 3],
+                item: Box::new(item),
+                result: Ok(PrText {
+                    mine: true,
+                    title: body.into(),
+                    body: format!("- [ ] {body}"),
+                }),
+            },
+        });
     }
 }
 

@@ -919,9 +919,10 @@ fn draw_confirm(frame: &mut Frame, label: &str) {
         .title(Line::styled(" Confirm ", BOLD))
         .title_bottom(hints(&[("y", "Yes"), ("n/Esc", "No")]));
     let text = format!("{}?", clean(label));
-    let width = (text.width() as u16 + 6).clamp(40, 76);
+    let len = u16::try_from(text.width()).unwrap_or(u16::MAX);
+    let width = len.saturating_add(6).clamp(40, 76);
     // Word wrapping may need a little more than the exact number of rows.
-    let rows = text.width() as u16 / (width - 8) + 1;
+    let rows = len / (width - 8) + 1;
     let inner = popup(frame, width, rows + 4, block);
     let inner = Rect {
         y: inner.y + 1.min(inner.height),
@@ -1335,6 +1336,184 @@ mod tests {
                     !text.contains("Merge") && !text.contains("Delete"),
                     "{text}"
                 );
+            }
+        }
+    }
+
+    /// Random keys and messages, drawn at random sizes. Tests cannot run `gh`.
+    #[test]
+    fn random_use_never_panics() {
+        use crate::api::{Candidates, Page, Readiness, Reviewer, Run, Ticket};
+        use crate::app::Msg;
+        use crate::doc::Source;
+        use crate::review::{Comment, Thread};
+        use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        let text = "é • **日本** `x`\n\n- ```\n  c\n  ```\n| a | b |\n|---|---|\n| 😀 | ệ |\n";
+        let page = |count: u64, kind: u32| Page {
+            total: 99,
+            cursor: (count.is_multiple_of(2)).then(|| "c".to_string()),
+            items: (0..count)
+                .map(|n| match kind {
+                    0 => Item::Ticket(Ticket {
+                        id: format!("id{n}"),
+                        repo: "ö/日本".into(),
+                        number: n,
+                        title: text.into(),
+                        state: ["OPEN", "MERGED", "CLOSED"][n as usize % 3].into(),
+                        author: Some(["me", "al"][n as usize % 2].into()),
+                        body: text.into(),
+                        head: "h".into(),
+                        draft: n.is_multiple_of(4),
+                        updated: "é".into(),
+                        ..Ticket::default()
+                    }),
+                    1 => Item::Release(crate::api::Release {
+                        repo: "o/r".into(),
+                        tag: text.into(),
+                        body: Some(text.into()),
+                        draft: n.is_multiple_of(2),
+                        ..Default::default()
+                    }),
+                    _ => Item::Run(Run {
+                        repo: "o/r".into(),
+                        id: n,
+                        title: text.into(),
+                        ..Run::default()
+                    }),
+                })
+                .collect(),
+            warning: None,
+        };
+        let source = |n: usize| Source {
+            head: format!("T\n{text}"),
+            body: format!("── Description\n{text}"),
+            tail: format!("── @a\n{text}"),
+            diff: Some(format!(
+                "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,2 +1,{} @@\n-é\n 日\n{}",
+                n + 1,
+                "+ệ long line of code\n".repeat(n)
+            )),
+            markdown: true,
+            oid: "x".into(),
+            threads: (0..n % 4)
+                .map(|t| Thread {
+                    id: t.to_string(),
+                    path: ["f", "other"][t % 2].into(),
+                    line: (t != 1).then_some(t as u32 + 1),
+                    side: ["RIGHT", "LEFT"][t % 2].into(),
+                    resolved: t == 2,
+                    can_reply: true,
+                    can_toggle: true,
+                    total: 60,
+                    comments: vec![Comment {
+                        id: Some(1),
+                        body: text.into(),
+                        at: "é".into(),
+                        ..Comment::default()
+                    }],
+                    ..Thread::default()
+                })
+                .collect(),
+            show_resolved: n.is_multiple_of(2),
+        };
+        let mut seed = 11u32;
+        let mut next = move |below: u32| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 12) % below
+        };
+        for round in 0..4 {
+            let mut app = App::new(
+                mpsc::channel().0,
+                (round % 2 == 0).then(|| "o/r".to_string()),
+            );
+            app.handle(Msg::Repos(Ok((
+                crate::api::Repos {
+                    login: "me".into(),
+                    orgs: vec!["o".into()],
+                    names: vec!["o/r".into(), "o/s".into()],
+                    ..Default::default()
+                },
+                None,
+            ))));
+            app.handle(Msg::Teams(Ok(vec!["o/t".into(), "o/é".into()])));
+            for step in 0..1_000 {
+                match next(40) {
+                    0 => app.feed(Tab::Prs, next(2) == 0, Ok(page(next(30).into(), 0))),
+                    1 => app.feed(Tab::Issues, false, Ok(page(next(9).into(), 0))),
+                    2 => app.feed(Tab::Releases, false, Ok(page(next(9).into(), 1))),
+                    3 => app.feed(Tab::Runs, false, Ok(page(next(9).into(), 2))),
+                    4 => app.feed_doc(next(2) == 0, Ok(source(next(60) as usize))),
+                    5 => app.feed_doc(next(2) == 0, Err(crate::gh::GhError(text.into()))),
+                    6 => app.handle(Msg::Reviews(Ok(vec![Reviews {
+                        id: format!("id{}", next(9)),
+                        reviewers: (0..next(6))
+                            .map(|n| Reviewer {
+                                name: format!("日本é{n}"),
+                                state: ["APPROVED", "REQUESTED", "X"][n as usize % 3].into(),
+                            })
+                            .collect(),
+                        ..Reviews::default()
+                    }]))),
+                    7 => app.feed_pick(
+                        Candidates {
+                            mine: true,
+                            requested: vec!["o/t".into()],
+                            people: vec![("é".into(), "al".into())],
+                        },
+                        text,
+                        Readiness {
+                            methods: vec!["Squash"],
+                            notes: vec![(false, text.into())],
+                            ..Readiness::default()
+                        },
+                        next(3),
+                    ),
+                    n => {
+                        let code = match next(26) {
+                            0 => KeyCode::Enter,
+                            1 | 2 => KeyCode::Esc,
+                            3 => KeyCode::Up,
+                            4 => KeyCode::Down,
+                            5 => KeyCode::Left,
+                            6 => KeyCode::Right,
+                            7 => KeyCode::Tab,
+                            8 => KeyCode::Backspace,
+                            9 => KeyCode::PageDown,
+                            10 => KeyCode::PageUp,
+                            11 => KeyCode::Char('ệ'),
+                            12 => KeyCode::Char(' '),
+                            _ => KeyCode::Char(char::from(33 + next(94) as u8)),
+                        };
+                        // Ctrl+S submits; Ctrl+C and q would end the round.
+                        let key = match n {
+                            8 => KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                            9 => KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+                            _ => KeyEvent::from(code),
+                        };
+                        app.handle(Msg::Input(Ok(Event::Key(key))));
+                        app.quit = false;
+                        if n == 10 {
+                            app.handle(Msg::Input(Ok(Event::Paste(text.into()))));
+                        }
+                        if n == 11 {
+                            app.busy = None;
+                        }
+                    }
+                }
+                if step % 3 == 0 {
+                    let sizes = [
+                        (1, 1),
+                        (9, 4),
+                        (20, 9),
+                        (80, 24),
+                        (83, 57),
+                        (130, 30),
+                        (190, 50),
+                    ];
+                    let (w, h) = sizes[next(sizes.len() as u32) as usize];
+                    screen(&mut app, w, h);
+                }
             }
         }
     }
