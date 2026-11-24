@@ -1352,6 +1352,10 @@ impl App {
                     Some(_) => None,
                     None => self.doc.cursor,
                 };
+                if let Err(e) = self.doc.place() {
+                    self.doc.anchor = None;
+                    self.error(e);
+                }
             }
             KeyCode::Char('x') => self.toggle_thread(),
             KeyCode::Enter | KeyCode::Char('c') => self.write_here(),
@@ -1507,12 +1511,14 @@ impl App {
         };
         if discard {
             review.findings.remove(n);
-            let left = review.findings.len();
+            let next = self.doc.finding_next_to(n);
             self.doc.cursor = None;
             self.ai_refresh();
+            // Those after the removed one moved up.
+            let next = next.map(|next| if next > n { next - 1 } else { next });
             let height = self.doc_height;
-            if left > 0 {
-                self.doc.go_to_finding(Some(n.min(left - 1)), height);
+            if next.is_some() {
+                self.doc.go_to_finding(next, height);
             }
         } else {
             finding.accepted = !finding.accepted;
@@ -2846,5 +2852,34 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.ai.tool, Some(Tool::Custom));
         assert!(app.ai_running.is_some());
+    }
+
+    #[test]
+    fn discarding_moves_to_the_next_finding_on_screen() {
+        let mut app = with_findings();
+        // On screen: three (no line), one, two.
+        press(&mut app, KeyCode::Char('A'));
+        app.doc.go_to_finding(Some(2), 40);
+        press(&mut app, KeyCode::Char('d'));
+        let title = |app: &App| {
+            let n = app.doc.finding_at_cursor().unwrap();
+            app.reviews["o/r#1"].findings[n].title.clone()
+        };
+        assert_eq!(title(&app), "one");
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(title(&app), "two");
+        press(&mut app, KeyCode::Char('d'));
+        assert!(app.doc.finding_at_cursor().is_none());
+    }
+
+    #[test]
+    fn a_range_starts_only_on_code() {
+        let mut app = reviewing();
+        press(&mut app, KeyCode::Char('u'));
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.doc.anchor.is_none());
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.doc.anchor.is_some());
     }
 }

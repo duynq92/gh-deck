@@ -485,6 +485,15 @@ impl Doc {
         self.findings.iter().find(|f| f.0 == line).map(|f| f.1)
     }
 
+    /// The finding shown after this one, or before it when it is the last.
+    pub fn finding_next_to(&self, n: usize) -> Option<usize> {
+        let mut order = self.findings.clone();
+        order.sort_unstable();
+        let at = order.iter().position(|f| f.1 == n)?;
+        let next = order.get(at + 1).or_else(|| order.get(at.checked_sub(1)?));
+        next.map(|f| f.1)
+    }
+
     /// Move the cursor to a finding, or to the first one.
     pub fn go_to_finding(&mut self, n: Option<usize>, height: usize) -> bool {
         let found = self.findings.iter().find(|f| n.is_none_or(|n| f.1 == n));
