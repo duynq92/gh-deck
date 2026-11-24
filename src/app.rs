@@ -884,6 +884,12 @@ impl App {
                     number,
                 });
             }
+            Act::Ready if !self.is_mine(&item) => {
+                self.error("you can mark only PRs opened by you as ready");
+            }
+            Act::Ready if item.state() != "draft" => {
+                self.error(format!("{} is {}, not a draft", item.id(), item.state()));
+            }
             Act::Merge if item.state() != "open" => {
                 self.error(format!("cannot merge a {} pull request", item.state()));
             }

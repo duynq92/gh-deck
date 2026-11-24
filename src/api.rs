@@ -1128,6 +1128,10 @@ pub fn simple(act: Act, item: &Item) -> Option<Cmd> {
             let name = if verb == "close" { "Close" } else { "Reopen" };
             (name, args(&[kind, verb, &t.number.to_string(), "-R", repo]))
         }
+        (Act::Ready, Item::Ticket(t)) if t.draft && t.state == "OPEN" => (
+            "Mark ready for review:",
+            args(&["pr", "ready", &t.number.to_string(), "-R", repo]),
+        ),
         (Act::Publish, Item::Release(r)) if r.draft => (
             "Publish",
             args(&[
@@ -1525,5 +1529,18 @@ mod tests {
             assert!(share(n) <= PAGE && share(n) * n >= PAGE, "{n}");
         }
         assert_eq!(share(1000), 10);
+    }
+
+    #[test]
+    fn only_open_drafts_become_ready() {
+        let Item::Ticket(mut t) = ticket("x") else {
+            unreachable!()
+        };
+        assert_eq!(simple(Act::Ready, &Item::Ticket(t.clone())), None);
+        t.draft = true;
+        let cmd = simple(Act::Ready, &Item::Ticket(t.clone())).unwrap();
+        assert_eq!(cmd.args, ["pr", "ready", "7", "-R", "o/r"]);
+        t.state = "CLOSED".into();
+        assert_eq!(simple(Act::Ready, &Item::Ticket(t)), None);
     }
 }
