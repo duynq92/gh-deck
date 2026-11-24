@@ -31,7 +31,7 @@ Press `?` in the app for the current tab's shortcuts.
 | Where | Keys |
 |---|---|
 | Everywhere | `1`-`4`/`Tab` tabs, `j`/`k` move, `g`/`G` top/end, `Enter` open, `Esc` back, `o` organization, `p` repo, `f` filter, `s` state, `/` find, `>` more, `R` refresh, `?` help, `q` quit |
-| Pull requests | `i` info, `d` diff, `n`/`N` next/previous file, `h` checks, `w` web, `a` approve, `x` request changes, `c` comment, `v` reviewers (your own PRs), `m` merge, `X` close/reopen, `b` checkout |
+| Pull requests | `i` info, `d` diff, `n`/`N` next/previous file, `h` checks, `w` web, `a` approve, `x` request changes, `c` comment, `v` reviewers (your own PRs), `m` merge, `X` close/reopen, `b` checkout, `t` excluded teams |
 | Issues | `i` info, `w` web, `n` new, `c` comment, `l` labels, `a` assignees, `X` close/reopen |
 | Releases | `i` info, `w` web, `D` download, `n` new, `e` edit, `P` publish, `X` delete |
 | Actions | `i` jobs, `l` log, `L` failed log, `w` web, `r` rerun all, `F` rerun failed, `x` cancel, `t` trigger workflow |
@@ -46,6 +46,11 @@ clears, `Enter` applies. Choices
 in one selector are alternatives; the selectors narrow each other. Without marks,
 `Enter` chooses just the highlighted row.
 
+Pull requests start with the filters opened by me, review requested from me,
+involving me, and review requested from my teams. `t` leaves noisy teams out of
+*my teams*; pull requests that ask you or another of your teams still show. The
+list is saved in `~/.config/ghdeck/excluded-teams` (or `$XDG_CONFIG_HOME`).
+
 Close, delete, publish, rerun, cancel and reviewer changes ask for `y` first. Merge and review
 actions open a form that is only sent with `Ctrl+S`.
 
@@ -59,10 +64,9 @@ actions open a form that is only sent with `Ctrl+S`.
 
 ## Limits
 
-- The Actions tab without a chosen repository reads the 12 most recently pushed
-  ones (one request each), 5 runs per repository.
-- The Releases tab without a chosen repository shows the 3 newest releases of the
-  50 most recently pushed ones.
+- Every list shows 50 rows; `>` loads more pull requests and issues.
+- Without chosen repositories, Actions reads the 12 most recently pushed ones (one
+  request each) and Releases the 3 newest releases of the 50 most recently pushed.
 - All tabs include your organizations; `o` narrows to some or to your own repositories.
 - Reviewers, approval and checks of pull requests appear a few seconds after the list.
 - The repository picker lists the 500 most recently pushed; use

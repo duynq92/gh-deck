@@ -228,7 +228,7 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
     let list = app.list();
     let count = if !list.find.is_empty() {
         format!("{}/{}", list.view.len(), list.items.len())
-    } else if list.cursor.is_some() {
+    } else if list.cursor.is_some() || list.total > list.items.len() {
         format!("{} of {}", list.items.len(), list.total)
     } else {
         list.items.len().to_string()
@@ -622,6 +622,7 @@ fn group_color(group: &Group) -> Color {
         "View" => Color::Blue,
         "Review" | "Edit" | "Run" => Color::Green,
         "Manage" => Color::Magenta,
+        "Teams" => Color::Cyan,
         _ => Color::Gray,
     }
 }
@@ -708,9 +709,13 @@ fn key_spans(app: &App, group: &Group) -> Vec<Span<'static>> {
             spans.push(Span::styled(format!("[{}] {label} ", k.key), DIM));
             continue;
         }
+        let count = match (k.act, app.excluded.len()) {
+            (Act::Exclude, n) if n > 0 => format!(" ({n})"),
+            _ => String::new(),
+        };
         let style = if risky { KEY.fg(Color::Red) } else { KEY };
         spans.push(Span::styled(format!("[{}]", k.key), style));
-        spans.push(Span::raw(format!(" {label} ")));
+        spans.push(Span::raw(format!(" {label}{count} ")));
     }
     spans
 }

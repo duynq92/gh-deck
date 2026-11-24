@@ -45,6 +45,7 @@ pub enum Act {
     Org,
     Repo,
     Filter,
+    Exclude,
     State,
     Find,
     More,
@@ -145,6 +146,10 @@ const PRS: &[Group] = &[
             k('X', "Close/Reopen", Act::Toggle),
             k('b', "Checkout", Act::Checkout),
         ],
+    },
+    Group {
+        name: "Teams",
+        keys: &[k('t', "Excluded teams", Act::Exclude)],
     },
 ];
 

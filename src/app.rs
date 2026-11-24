@@ -1,11 +1,13 @@
 //! Application state and key handling.
 
 use crate::api::{self, Candidates, Choice, Detail, Item, Page, Query, Repos, Reviews};
+use crate::config;
 use crate::doc::Doc;
 use crate::form::{self, Form};
 use crate::gh::{self, Cmd, GhError, Result};
 use crate::keys::{self, Act, Tab};
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 use std::thread;
@@ -56,6 +58,8 @@ pub struct List {
     pub cursor: Option<String>,
     pub loading: bool,
     pub loaded: bool,
+    /// Loads as soon as the repositories and teams are known.
+    waiting: bool,
     pub filters: Vec<Choice>,
     pub states: Vec<Choice>,
     pub find: String,
@@ -82,6 +86,7 @@ pub enum Pick {
     Scope,
     Filter,
     State,
+    Exclude,
     Target(Act),
     Workflow(String),
     Reviewers {
@@ -107,7 +112,12 @@ impl Picker {
     pub fn multi(&self) -> bool {
         matches!(
             self.pick,
-            Pick::Org | Pick::Scope | Pick::Filter | Pick::State | Pick::Reviewers { .. }
+            Pick::Org
+                | Pick::Scope
+                | Pick::Filter
+                | Pick::State
+                | Pick::Exclude
+                | Pick::Reviewers { .. }
         )
     }
 
@@ -141,8 +151,8 @@ impl Picker {
             (true, _) => self.marked.clone(),
             (false, true) => {
                 let mut one = vec![self.view().get(self.sel)?.1.clone()];
-                // Asking one more person must not withdraw the others.
-                if matches!(self.pick, Pick::Reviewers { .. }) {
+                // Adding one more must not drop the others.
+                if matches!(self.pick, Pick::Exclude | Pick::Reviewers { .. }) {
                     one.extend(self.marked.iter().cloned());
                 }
                 one
@@ -188,6 +198,11 @@ pub struct App {
     /// Chosen repositories.
     pub scope: Vec<Choice>,
     pub repos: Option<Repos>,
+    teams_ready: bool,
+    /// Teams left out of "my teams".
+    pub excluded: Vec<String>,
+    /// Where `excluded` is saved; `None` until it was read without trouble.
+    config: Option<PathBuf>,
     pub modal: Option<Modal>,
     pub finding: bool,
     pub detail_focus: bool,
@@ -212,12 +227,16 @@ impl App {
             tx,
             tab: Tab::Prs,
             lists: Tab::ALL.map(|tab| List {
+                filters: api::default_filters(tab),
                 states: api::default_states(tab),
                 ..List::default()
             }),
             orgs: Vec::new(),
             scope: scope.into_iter().map(|s| (s.clone(), s)).collect(),
             repos: None,
+            teams_ready: false,
+            excluded: Vec::new(),
+            config: None,
             modal: None,
             finding: false,
             detail_focus: false,
@@ -235,7 +254,21 @@ impl App {
         }
     }
 
+    fn load_config(&mut self) {
+        let Some(path) = config::path() else {
+            return self.error("cannot find a config directory: HOME is not set");
+        };
+        match config::load(&path) {
+            Ok(teams) => {
+                self.excluded = teams;
+                self.config = Some(path);
+            }
+            Err(e) => self.error(format!("{}: {e}", path.display())),
+        }
+    }
+
     pub fn start(&mut self) {
+        self.load_config();
         self.load_repos(None);
         self.load(self.tab, false);
     }
@@ -272,15 +305,16 @@ impl App {
     }
 
     fn load(&mut self, tab: Tab, append: bool) {
-        let repos = match &self.repos {
-            Some(r) => r.clone(),
-            None if !self.scope.is_empty() => Repos::default(),
-            None => {
-                // Continues when the repository list arrives.
-                self.lists[tab as usize].loading = true;
-                return;
-            }
-        };
+        let list = &mut self.lists[tab as usize];
+        let teams = list.filters.iter().any(|f| f.1 == api::MY_TEAMS) && !self.teams_ready;
+        list.waiting = teams || (self.repos.is_none() && self.scope.is_empty());
+        if list.waiting {
+            list.job += 1; // ignore an older list still in flight
+            list.loading = true;
+            return;
+        }
+        let mut repos = self.repos.clone().unwrap_or_default();
+        repos.teams.retain(|t| !self.excluded.contains(t));
         let (orgs, scope) = (self.orgs.clone(), self.scope.clone());
         let list = &mut self.lists[tab as usize];
         list.job += 1;
@@ -300,6 +334,14 @@ impl App {
             append,
             result: api::list(&query, &repos),
         });
+    }
+
+    fn load_waiting(&mut self) {
+        for tab in Tab::ALL {
+            if self.lists[tab as usize].waiting {
+                self.load(tab, false);
+            }
+        }
     }
 
     /// Drop the current rows and load again (scope, filter or state changed).
@@ -391,14 +433,8 @@ impl App {
                 repos.names.extend(page.names);
                 let wanted = repos.names.len() < api::MAX_REPOS;
                 // Lists need only the first page, so they start right away.
-                if first && self.scope.is_empty() {
-                    for tab in Tab::ALL {
-                        if self.lists[tab as usize].loading {
-                            self.load(tab, false);
-                        }
-                    }
-                }
                 if first {
+                    self.load_waiting();
                     let login = self.repos.as_ref().map(|r| r.login.clone());
                     let login = login.unwrap_or_default();
                     self.spawn(move || Msg::Teams(api::teams(&login)));
@@ -411,13 +447,20 @@ impl App {
                 if let Some(repos) = &mut self.repos {
                     repos.teams = teams;
                 }
+                self.teams_ready = true;
+                self.load_waiting();
             }
-            Msg::Teams(Err(e)) => self.error(format!("cannot list your teams: {e}")),
+            Msg::Teams(Err(e)) => {
+                self.teams_ready = true;
+                self.load_waiting();
+                self.error(format!("cannot list your teams: {e}"));
+            }
             Msg::Reviews(Ok(reviews)) => self.reviewed(reviews),
             Msg::Reviews(Err(e)) => self.error(format!("cannot load reviews: {e}")),
             Msg::Repos(Err(e)) => {
-                if self.repos.is_none() && self.scope.is_empty() {
-                    for list in &mut self.lists {
+                if self.repos.is_none() {
+                    for list in self.lists.iter_mut().filter(|l| l.waiting) {
+                        list.waiting = false;
                         list.loading = false;
                     }
                 }
@@ -554,7 +597,9 @@ impl App {
                 if tab == self.tab {
                     self.sync_doc();
                 }
-                if !ids.is_empty() {
+                // GitHub answers two small requests faster than a big one.
+                for ids in ids.chunks(25) {
+                    let ids = ids.to_vec();
                     self.spawn(move || Msg::Reviews(api::reviews(&ids)));
                 }
                 if let Some(w) = page.warning {
@@ -732,8 +777,9 @@ impl App {
                 let teams = self.repos.as_ref().map_or(&[][..], |r| &r.teams);
                 let items = api::filters(self.tab, teams);
                 let marked = self.list().filters.clone();
-                self.multi_picker("Filter", items, &marked, Pick::Filter);
+                self.multi_picker("Filter", "All", items, &marked, Pick::Filter);
             }
+            Act::Exclude => self.pick_excluded(),
             Act::NextFile | Act::PrevFile => {
                 if self.doc.has_files() {
                     self.detail_focus = true;
@@ -746,13 +792,20 @@ impl App {
             Act::State => {
                 let items = api::states(self.tab);
                 let marked = self.list().states.clone();
-                self.multi_picker("State", items, &marked, Pick::State);
+                self.multi_picker("State", "All", items, &marked, Pick::State);
             }
             Act::More => {
                 if self.list().cursor.is_some() && !self.list().loading {
                     self.load(self.tab, true);
                 } else if !self.list().loading {
-                    self.info("everything is loaded");
+                    let (shown, total) = (self.list().items.len(), self.list().total);
+                    if matches!(self.tab, Tab::Releases | Tab::Runs) && shown < total {
+                        self.info(format!(
+                            "showing the newest {shown}; choose fewer repositories with [p] for older ones"
+                        ));
+                    } else {
+                        self.info("everything is loaded");
+                    }
                 }
             }
             Act::Refresh => {
@@ -940,7 +993,7 @@ impl App {
         items.retain(|i| !self.scope.contains(i));
         items.splice(0..0, self.scope.iter().cloned());
         let marked = self.scope.clone();
-        self.multi_picker("Repositories", items, &marked, Pick::Scope);
+        self.multi_picker("Repositories", "All", items, &marked, Pick::Scope);
     }
 
     fn pick_org(&mut self) {
@@ -952,16 +1005,62 @@ impl App {
         let me = (format!("{} (personal)", repos.login), repos.login.clone());
         let items = orgs.chain([me]).collect();
         let marked = self.orgs.clone();
-        self.multi_picker("Organizations", items, &marked, Pick::Org);
+        self.multi_picker("Organizations", "All", items, &marked, Pick::Org);
+    }
+
+    fn pick_excluded(&mut self) {
+        if !self.teams_ready {
+            return self.error("your teams are not loaded yet; press R to retry");
+        }
+        if self.config.is_none() {
+            return self.error("the saved list could not be read; fix it and start again");
+        }
+        let teams = self.repos.iter().flat_map(|r| &r.teams);
+        // Excluded first, also those the user has left meanwhile.
+        let mut names = self.excluded.clone();
+        names.extend(teams.filter(|t| !self.excluded.contains(t)).cloned());
+        if names.is_empty() {
+            return self.error("you are in no team");
+        }
+        let items = names.into_iter().map(|n| (n.clone(), n)).collect();
+        let marked: Vec<Choice> = self
+            .excluded
+            .iter()
+            .map(|t| (t.clone(), t.clone()))
+            .collect();
+        let title = "Leave out of \u{201c}my teams\u{201d}";
+        self.multi_picker(title, "None", items, &marked, Pick::Exclude);
+    }
+
+    fn exclude(&mut self, teams: Vec<String>) {
+        if let Some(path) = &self.config
+            && let Err(e) = config::save(path, &teams)
+        {
+            let text = format!("{}: {e}", path.display());
+            return self.error(text);
+        }
+        self.excluded = teams;
+        if self.list().filters.iter().any(|f| f.1 == api::MY_TEAMS) {
+            self.reset();
+        } else {
+            self.info("saved; applies to the filter Review requested: my teams");
+        }
     }
 
     /// A picker for several choices, with an "All" row. Tabs without choices
     /// have none to pick.
-    fn multi_picker(&mut self, title: &str, items: Vec<Choice>, marked: &[Choice], pick: Pick) {
+    fn multi_picker(
+        &mut self,
+        title: &str,
+        all: &str,
+        items: Vec<Choice>,
+        marked: &[Choice],
+        pick: Pick,
+    ) {
         if items.is_empty() {
             return;
         }
-        let mut all = vec![("All".to_string(), String::new())];
+        let mut all = vec![(all.to_string(), String::new())];
         all.extend(items);
         let sel = all.iter().position(|i| marked.contains(i));
         self.picker(title.into(), all, sel.unwrap_or_default(), pick);
@@ -1084,6 +1183,7 @@ impl App {
                 self.list_mut().states = chosen;
                 self.reset();
             }
+            Pick::Exclude => self.exclude(chosen.into_iter().map(|c| c.1).collect()),
             Pick::Reviewers {
                 repo,
                 number,
@@ -1101,7 +1201,12 @@ impl App {
 
     fn picked(&mut self, pick: Pick, value: String) {
         match pick {
-            Pick::Org | Pick::Scope | Pick::Filter | Pick::State | Pick::Reviewers { .. } => {}
+            Pick::Org
+            | Pick::Scope
+            | Pick::Filter
+            | Pick::State
+            | Pick::Exclude
+            | Pick::Reviewers { .. } => {}
             Pick::Target(act) => self.target(act, value),
             Pick::Workflow(repo) => {
                 if let Some(form) = Form::new(self.tab, Act::Trigger, &repo, None, &value) {
@@ -1330,5 +1435,48 @@ mod tests {
         press(&mut app, KeyCode::Char('v'));
         assert!(app.busy.is_none());
         assert!(matches!(app.status, Some(Status::Error(_))));
+    }
+
+    #[test]
+    fn excluded_teams_are_saved_and_can_be_cleared() {
+        let dir = std::env::temp_dir().join(format!("ghdeck-app-{}", std::process::id()));
+        let path = dir.join("excluded-teams");
+        let mut app = app();
+        app.lists[0].filters.clear(); // so nothing is reloaded
+        app.teams_ready = true;
+        app.config = Some(path.clone());
+        app.repos = Some(Repos {
+            teams: vec!["o/all".into(), "o/mine".into()],
+            ..Repos::default()
+        });
+        for code in [
+            KeyCode::Char('t'),
+            KeyCode::Down,
+            KeyCode::Char(' '),
+            KeyCode::Enter,
+        ] {
+            press(&mut app, code);
+        }
+        assert_eq!(app.excluded, ["o/all"]);
+        assert_eq!(config::load(&path).unwrap(), ["o/all"]);
+        press(&mut app, KeyCode::Char('t'));
+        app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        press(&mut app, KeyCode::Enter);
+        assert!(config::load(&path).unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn default_filters_wait_for_the_teams() {
+        let mut app = app();
+        app.load(Tab::Prs, false);
+        assert!(app.lists[0].waiting && app.lists[0].loading);
+        app.load(Tab::Runs, false); // has no team filter
+        assert!(!app.lists[3].waiting);
+        app.handle(Msg::Repos(Err(GhError("offline".into()))));
+        assert!(!app.lists[0].waiting && !app.lists[0].loading);
+        app.load(Tab::Prs, false);
+        app.handle(Msg::Teams(Err(GhError("no scope".into()))));
+        assert!(!app.lists[0].waiting && app.lists[0].loading);
     }
 }
