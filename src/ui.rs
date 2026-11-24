@@ -720,8 +720,11 @@ fn key_spans(app: &App, group: &Group) -> Vec<Span<'static>> {
             k.act,
             Act::Merge | Act::Toggle | Act::Delete | Act::Cancel | Act::Publish
         );
-        let off =
-            k.act == Act::Reviewers && app.list().selected().is_some_and(|item| !app.is_mine(item));
+        let off = app.list().selected().is_some_and(|item| match k.act {
+            Act::Reviewers => !app.is_mine(item),
+            Act::Ready => !app.is_mine(item) || item.state() != "draft",
+            _ => false,
+        });
         if off {
             spans.push(Span::styled(format!("[{}] {label} ", k.key), DIM));
             continue;

@@ -67,6 +67,7 @@ pub enum Act {
     Toggle,
     Checkout,
     Reviewers,
+    Ready,
     New,
     Labels,
     Assignees,
@@ -144,6 +145,7 @@ const PRS: &[Group] = &[
         name: "Manage",
         keys: &[
             k('v', "Reviewers", Act::Reviewers),
+            k('r', "Mark ready", Act::Ready),
             k('m', "Merge", Act::Merge),
             k('X', "Close/Reopen", Act::Toggle),
             k('b', "Checkout", Act::Checkout),
