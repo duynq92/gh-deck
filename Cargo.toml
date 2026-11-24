@@ -1,0 +1,19 @@
+[package]
+name = "ghdeck"
+version = "0.1.0"
+edition = "2024"
+description = "Keyboard-driven TUI for GitHub, powered by the gh CLI"
+publish = false
+
+[dependencies]
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+unicode-width = "0.2.3"
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
