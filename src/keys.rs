@@ -92,6 +92,25 @@ pub struct Key {
     pub act: Act,
 }
 
+impl Group {
+    /// Keys as shown. One without a label shares the label before it, so that
+    /// `n` and `N` read `n/N`.
+    pub fn shown(&self) -> impl Iterator<Item = (String, &Key)> {
+        self.keys
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| !k.label.is_empty())
+            .map(|(i, k)| {
+                let mut name = k.key.to_string();
+                for more in self.keys[i + 1..].iter().take_while(|k| k.label.is_empty()) {
+                    name.push('/');
+                    name.push(more.key);
+                }
+                (name, k)
+            })
+    }
+}
+
 pub struct Group {
     pub name: &'static str,
     pub keys: &'static [Key],
@@ -130,8 +149,8 @@ const PRS: &[Group] = &[
         keys: &[
             k('i', "Info", Act::Info),
             k('d', "Diff", Act::Diff),
-            k('n', "Next file", Act::NextFile),
-            k('N', "Prev file", Act::PrevFile),
+            k('n', "Next/prev file", Act::NextFile),
+            k('N', "", Act::PrevFile),
             k('h', "Checks", Act::Checks),
             k('w', "Web", Act::Web),
         ],
@@ -148,7 +167,7 @@ const PRS: &[Group] = &[
         name: "My PR",
         keys: &[
             k('v', "Reviewers", Act::Reviewers),
-            k('r', "Mark ready", Act::Ready),
+            k('r', "Ready", Act::Ready),
             k('e', "Title", Act::Title),
             k('E', "Description", Act::Description),
             k('T', "Checkboxes", Act::Tasks),
@@ -164,7 +183,7 @@ const PRS: &[Group] = &[
     },
     Group {
         name: "Teams",
-        keys: &[k('t', "Excluded teams", Act::Exclude)],
+        keys: &[k('t', "Hide teams", Act::Exclude)],
     },
 ];
 

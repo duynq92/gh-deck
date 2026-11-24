@@ -1131,7 +1131,7 @@ impl App {
             .iter()
             .map(|t| (t.clone(), t.clone()))
             .collect();
-        let title = "Leave out of \u{201c}my teams\u{201d}";
+        let title = "Hide PRs requested only from";
         self.multi_picker(title, "None", items, &marked, Pick::Exclude);
     }
 
