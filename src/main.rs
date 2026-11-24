@@ -6,6 +6,7 @@ mod form;
 mod gh;
 mod keys;
 mod markdown;
+mod review;
 mod tasks;
 mod ui;
 

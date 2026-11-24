@@ -32,7 +32,7 @@ its letter, or move with the arrows and press `Enter`. `?` explains the current 
 | Where | Keys |
 |---|---|
 | Everywhere | `1`-`4`/`Tab` tabs, `j`/`k` move, `g`/`G` top/end, `Enter` open, `Esc` back, `o` organization, `p` repo, `f` filter, `s` state, `/` find, `>` more, `R` refresh, `z` zoom, `.` all actions, `?` help, `!` last message, `q` quit |
-| Pull requests | `i` info, `M` raw/rendered Markdown, `d` diff, `n`/`N` next/previous file, `h` checks, `w` web, `a` approve, `x` request changes, `c` comment, `v` reviewers, `r` ready (from draft), `e` title, `E` description and `T` checkboxes (your own PRs), `m` merge, `X` close/reopen, `b` checkout, `t` hide teams |
+| Pull requests | `i` info, `M` raw/rendered Markdown, `d` diff, `n`/`N` next/previous file, `h` checks, `w` web, `l` line comment, `u`/`U` next/previous discussion, `O` resolved discussions, `a` approve, `x` request changes, `c` comment, `v` reviewers, `r` ready (from draft), `e` title, `E` description and `T` checkboxes (your own PRs), `m` merge, `X` close/reopen, `b` checkout, `t` hide teams |
 | Issues | `i` info, `w` web, `n` new, `c` comment, `l` labels, `a` assignees, `X` close/reopen |
 | Releases | `i` info, `w` web, `D` download, `n` new, `e` edit, `P` publish, `X` delete |
 | Actions | `i` jobs, `l` log, `L` failed log, `w` web, `r` rerun all, `F` rerun failed, `x` cancel, `t` trigger workflow |
@@ -54,6 +54,16 @@ list is saved in `~/.config/ghdeck/excluded-teams` (or `$XDG_CONFIG_HOME`).
 
 Close, delete, publish, rerun, cancel, mark ready and reviewer changes ask for `y` first. Merge, review
 and text actions open a form that is only sent with `Ctrl+S`.
+
+Discussions are shown under their line of code; resolved ones are folded until `O`.
+`l` starts line mode on the code: move with `j`/`k`, `Space` starts a range, `Enter`
+comments, and on a discussion `Enter` replies and `x` resolves or reopens. Comments
+are posted at once, not as part of a pending review.
+
+`m` first shows conflicts, approval, checks and open discussions, and offers only the
+merge methods the repository allows. Organizations, repositories, filters, states and
+the raw/rendered choice are remembered in `~/.config/ghdeck/view.json`; a repository
+given on the command line is not.
 
 Titles and descriptions are loaded when you press the key. Saving is refused when
 they changed on GitHub meanwhile. Ticking checkboxes saves at once; unticking asks.

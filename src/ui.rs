@@ -587,7 +587,15 @@ fn draw_doc(frame: &mut Frame, app: &mut App, area: Rect) {
     };
     let mut block = pane(app.detail_focus && app.modal.is_none())
         .title(Line::styled(format!(" {name}{loading} "), BOLD));
-    block = block.title_bottom(if app.detail_focus {
+    let line_mode = app.detail_focus && app.doc.cursor.is_some();
+    block = block.title_bottom(if line_mode {
+        hints(&[
+            ("j/k", "Line"),
+            ("n/N", "File"),
+            ("u/U", "Discussion"),
+            ("Esc", "Leave line mode"),
+        ])
+    } else if app.detail_focus {
         hints(&[
             ("j/k", "Scroll"),
             ("Space", "Page"),
@@ -627,6 +635,10 @@ fn draw_doc(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(text, area);
         if let Some(color) = background {
             frame.buffer_mut().set_style(area, Style::new().bg(color));
+        }
+        if row.selected {
+            let style = Style::new().add_modifier(Modifier::REVERSED);
+            frame.buffer_mut().set_style(area, style);
         }
     }
 }
@@ -669,10 +681,20 @@ fn doc_line<'a>(row: &Visible<'a>) -> (Line<'a>, Option<Color>) {
         ),
         LineKind::Hunk => (fg(Color::Magenta), None),
         LineKind::Block => (fg(Color::Indexed(252)), Some(Color::Indexed(236))),
+        LineKind::Open => (
+            fg(Color::Indexed(220)).add_modifier(Modifier::BOLD),
+            Some(Color::Indexed(235)),
+        ),
+        LineKind::Done => (fg(Color::Indexed(114)), Some(Color::Indexed(235))),
+        LineKind::Note => (fg(Color::Indexed(252)), Some(Color::Indexed(235))),
         LineKind::Summary if indent == 0 => return (summary_line(text), None),
         _ => (Style::new(), None),
     };
-    let mut spans = vec![Span::raw(" ".repeat(indent))];
+    let mut margin = " ".repeat(indent);
+    if kind == LineKind::Note && indent > GUTTER {
+        margin = format!("{}┃{}", " ".repeat(GUTTER), " ".repeat(indent - GUTTER - 1));
+    }
+    let mut spans = vec![Span::raw(margin)];
     let parts = row.parts.iter();
     spans.extend(parts.map(|(text, bits)| Span::styled(*text, base.patch(inline(*bits)))));
     (Line::from(spans), background)
@@ -765,6 +787,29 @@ fn action(app: &App, name: &str, k: &Key, color: Color) -> [Span<'static>; 2] {
 
 /// What is useful right now, as far as it fits; the popup has the rest.
 fn footer_line(app: &App, width: usize) -> Line<'static> {
+    if app.detail_focus && app.doc.cursor.is_some() {
+        let keys: &[(&str, &str)] = match (app.doc.thread_at_cursor(), app.doc.anchor) {
+            (Some(_), _) => &[
+                ("Enter", "Reply"),
+                ("x", "Resolve/Reopen"),
+                ("O", "Resolved"),
+            ],
+            (None, None) => &[
+                ("Enter", "Comment"),
+                ("Space", "Start range"),
+                ("z", "Zoom"),
+            ],
+            (None, Some(_)) => &[("Enter", "Comment on range"), ("Space", "Drop range")],
+        };
+        let mut line = hints(keys);
+        let badge = Style::new().fg(Color::Black).bg(Color::Yellow);
+        line.spans.insert(
+            0,
+            Span::styled(" LINE MODE ", badge.add_modifier(Modifier::BOLD)),
+        );
+        line.spans.extend(hints(&[("Esc", "Leave")]).spans);
+        return line;
+    }
     let find = |act: Act| {
         keys::all(app.tab).find_map(|g| {
             let (name, k) = g.shown().find(|(_, k)| k.act == act)?;
@@ -917,7 +962,9 @@ fn draw_help(frame: &mut Frame, tab: Tab) {
         }
     }
     if tab == Tab::Prs {
-        lines.push(Line::raw(""));
+        lines.push(Line::raw(
+            " LINE MODE  l start, Space range, Enter comment or reply, x resolve",
+        ));
         let columns = " COLUMNS  S state: Open, Draft, Merged, Closed   C checks   A approval";
         lines.push(Line::raw(columns));
         let marks = [
@@ -1023,7 +1070,23 @@ fn draw_form(frame: &mut Frame, form: &Form) {
         Act::Description => (120, 40),
         _ => (84, wanted),
     };
-    let inner = popup(frame, width, wanted + 3, block);
+    let notes = form.notes.len() as u16;
+    let mut inner = popup(frame, width, wanted + notes + 3, block);
+    for (good, text) in &form.notes {
+        let (mark, color) = if *good {
+            ("✓", Color::Green)
+        } else {
+            ("✗", Color::Red)
+        };
+        let row = Rect {
+            height: 1.min(inner.height),
+            ..inner
+        };
+        let text = fit(&format!(" {mark} {text}"), row.width as usize);
+        frame.render_widget(Line::styled(text, Style::new().fg(color)), row);
+        inner.y += row.height;
+        inner.height -= row.height;
+    }
     let areas = Layout::vertical(heights).split(inner);
     for (i, field) in form.fields.iter().enumerate() {
         let (area, focused) = (areas[i], i == form.focus);

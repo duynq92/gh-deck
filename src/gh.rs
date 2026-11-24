@@ -32,12 +32,14 @@ pub const DIFF: Keep = Keep::Head(2 << 20);
 pub const LOG: Keep = Keep::Tail(2 << 20);
 
 /// A fully built `gh` invocation.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Cmd {
     pub label: String,
     pub args: Vec<String>,
     pub stdin: Option<String>,
     pub guard: Option<Guard>,
+    /// The open document shows the change, so load it again.
+    pub reload: bool,
 }
 
 /// Text that must still be on GitHub, so an edit never overwrites a newer one.

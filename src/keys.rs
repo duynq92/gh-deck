@@ -52,6 +52,13 @@ pub enum Act {
     Refresh,
     Zoom,
     Raw,
+    Lines,
+    NextThread,
+    PrevThread,
+    Resolved,
+    // Only in line mode
+    LineComment,
+    Reply,
     Menu,
     Help,
     Message,
@@ -167,6 +174,15 @@ const PRS: &[Group] = &[
             k('a', "Approve", Act::Approve),
             k('x', "Request changes", Act::RequestChanges),
             k('c', "Comment", Act::Comment),
+        ],
+    },
+    Group {
+        name: "Code",
+        keys: &[
+            k('l', "Line comment", Act::Lines),
+            k('u', "Discussions", Act::NextThread),
+            k('U', "", Act::PrevThread),
+            k('O', "Resolved", Act::Resolved),
         ],
     },
     Group {
@@ -286,8 +302,9 @@ pub fn footer(tab: Tab, reading: bool) -> &'static [Act] {
     match (tab, reading) {
         (Tab::Prs, true) => &[
             NextFile,
+            Lines,
+            NextThread,
             Zoom,
-            Raw,
             Approve,
             RequestChanges,
             Comment,
@@ -295,6 +312,8 @@ pub fn footer(tab: Tab, reading: bool) -> &'static [Act] {
             Merge,
             Diff,
             Info,
+            Raw,
+            Resolved,
             Checks,
             Description,
             Tasks,

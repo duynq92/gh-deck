@@ -13,7 +13,7 @@ pub enum Kind {
         multi: bool,
     },
     Toggle(bool),
-    Choice(&'static [&'static str], usize),
+    Choice(Vec<&'static str>, usize),
 }
 
 impl Kind {
@@ -45,6 +45,8 @@ pub struct Form {
     pub fields: Vec<Field>,
     pub focus: usize,
     pub error: Option<String>,
+    /// Facts to know before submitting, and whether they are good.
+    pub notes: Vec<(bool, String)>,
 }
 
 fn field(label: &'static str, kind: Kind) -> Field {
@@ -57,6 +59,8 @@ impl Form {
         let area = |s: &str| Kind::text(s, true);
         let (verb, fields) = match (act, &item) {
             (Act::Comment, Some(_)) => ("Comment on", vec![field("Comment", area(""))]),
+            (Act::LineComment, Some(_)) => ("Comment on", vec![field("Comment", area(""))]),
+            (Act::Reply, Some(_)) => ("Reply in", vec![field("Reply", area(""))]),
             (Act::Approve, Some(_)) => ("Approve", vec![field("Comment (optional)", area(""))]),
             (Act::RequestChanges, Some(_)) => {
                 ("Request changes on", vec![field("Comment", area(""))])
@@ -66,7 +70,7 @@ impl Form {
                 vec![
                     field(
                         "Method",
-                        Kind::Choice(&["Merge commit", "Squash", "Rebase"], 0),
+                        Kind::Choice(vec!["Merge commit", "Squash", "Rebase"], 0),
                     ),
                     field("Delete branch", Kind::Toggle(false)),
                 ],
@@ -150,6 +154,7 @@ impl Form {
             fields,
             focus: 0,
             error: None,
+            notes: Vec::new(),
         })
     }
 
@@ -164,10 +169,11 @@ impl Form {
         matches!(self.fields[i].kind, Kind::Toggle(true))
     }
 
-    pub fn choice(&self, i: usize) -> usize {
-        match self.fields[i].kind {
-            Kind::Choice(_, n) => n,
-            _ => 0,
+    /// Text of the chosen option.
+    pub fn chosen(&self, i: usize) -> &'static str {
+        match &self.fields[i].kind {
+            Kind::Choice(all, n) => all.get(*n).copied().unwrap_or(""),
+            _ => "",
         }
     }
 
