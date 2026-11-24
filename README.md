@@ -31,12 +31,12 @@ its letter, or move with the arrows and press `Enter`. `?` explains the current 
 
 | Where | Keys |
 |---|---|
-| Everywhere | `1`-`5`/`Tab` tabs, `j`/`k` move, `g`/`G` top/end, `Enter` open, `Esc` back, `o` organization, `p` repo, `f` filter, `s` state, `/` find, `>` more, `R` refresh, `z` zoom, `.` all actions, `?` help, `!` last message, `q` quit |
+| Everywhere | `1`-`4`/`Tab` tabs, `5` activity panel, `j`/`k` move, `g`/`G` top/end, `Enter` open, `Esc` back, `o` organization, `p` repo, `f` filter, `s` state, `/` find, `>` more, `R` refresh, `z` zoom, `.` all actions, `?` help, `!` last message, `q` quit |
 | Pull requests | `i` info, `M` raw/rendered Markdown, `d` diff, `n`/`N` next/previous file, `h` checks, `w` web, `l` line comment, `u`/`U` next/previous discussion, `O` resolved discussions, `a` approve, `x` request changes, `c` comment, `A` AI review, `P` post findings, `v` reviewers, `r` ready (from draft), `e` title, `E` description and `T` checkboxes (your own PRs), `m` merge, `X` close/reopen, `b` checkout, `t` hide teams |
 | Issues | `i` info, `w` web, `n` new, `c` comment, `l` labels, `a` assignees, `X` close/reopen |
 | Releases | `i` info, `w` web, `D` download, `n` new, `e` edit, `P` publish, `X` delete |
 | Actions | `i` jobs, `l` log, `L` failed log, `w` web, `r` rerun all, `F` rerun failed, `x` cancel, `t` trigger workflow |
-| Activity | `S` mark all seen, `B` show bots, and every pull request key |
+| Activity panel | `S` mark all seen, `B` show bots, and every pull request key |
 | Forms | `Ctrl+S` submit, `Tab` next field, `Esc` cancel |
 
 Reviewer marks: `✓` approved, `✗` changes requested, `●` waiting, `·` commented,
@@ -71,7 +71,7 @@ they changed on GitHub meanwhile. Ticking checkboxes saves at once; unticking as
 
 ## Activity
 
-The Activity tab lists what others did on pull requests you opened, review, commented
+The panel below the pull requests (`5`, back with `1` or `Esc`) lists what others did on pull requests you opened, review, commented
 on, or were asked about (hidden teams excepted): approvals, requested changes, comments,
 mentions, commits, merges and failed checks of your own. `Enter` opens the pull request,
 at the discussion when there is one, and marks it seen; `●` marks what is new, also in

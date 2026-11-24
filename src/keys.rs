@@ -19,13 +19,23 @@ impl Tab {
         Tab::Activity,
     ];
 
+    /// Tabs of the header.
+    pub const BAR: [Tab; 4] = [Tab::Prs, Tab::Issues, Tab::Releases, Tab::Runs];
+
+    /// The tab of the header: Activity is a panel of the pull requests.
+    pub fn bar(self) -> Tab {
+        match self {
+            Tab::Activity => Tab::Prs,
+            tab => tab,
+        }
+    }
+
     pub fn tiny(self) -> &'static str {
         match self {
-            Tab::Prs => "PR",
+            Tab::Prs | Tab::Activity => "PR",
             Tab::Issues => "Iss",
             Tab::Releases => "Rel",
             Tab::Runs => "Act",
-            Tab::Activity => "New",
         }
     }
 

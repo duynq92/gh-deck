@@ -423,8 +423,15 @@ impl App {
     pub fn start(&mut self) {
         self.load_config();
         self.load_repos(None);
-        self.load(self.tab, false);
-        self.load(Tab::Activity, false);
+        self.load_screen(self.tab);
+    }
+
+    /// Load a tab; the pull requests are shown together with their activity.
+    fn load_screen(&mut self, tab: Tab) {
+        self.load(tab.bar(), false);
+        if tab.bar() == Tab::Prs {
+            self.load(Tab::Activity, false);
+        }
     }
 
     fn load_repos(&mut self, after: Option<String>) {
@@ -892,10 +899,7 @@ impl App {
                     Ok(out) => {
                         let last = out.trim().lines().last().unwrap_or("").to_string();
                         self.info(format!("✓ {label} {last}"));
-                        self.load(tab, false);
-                        if tab == Tab::Prs {
-                            self.load(Tab::Activity, false);
-                        }
+                        self.load_screen(tab);
                         // Posted findings are discussions now.
                         if let Some(form) = form.filter(|f| f.act == Act::AiPost)
                             && let Some(item) = &form.item
@@ -1053,9 +1057,9 @@ impl App {
             KeyCode::PageUp => self.step(-self.page()),
             KeyCode::Char('g') | KeyCode::Home => self.step(isize::MIN),
             KeyCode::Char('G') | KeyCode::End => self.step(isize::MAX),
-            KeyCode::Tab => self.switch((self.tab as usize + 1) % Tab::ALL.len()),
+            KeyCode::Tab => self.switch((self.tab.bar() as usize + 1) % Tab::BAR.len()),
             KeyCode::BackTab => {
-                self.switch((self.tab as usize + Tab::ALL.len() - 1) % Tab::ALL.len())
+                self.switch((self.tab.bar() as usize + Tab::BAR.len() - 1) % Tab::BAR.len())
             }
             KeyCode::Char(c @ '1'..='5') => self.switch(c as usize - '1' as usize),
             KeyCode::Enter if !self.detail_focus => self.open_doc(Act::Info),
@@ -1082,6 +1086,8 @@ impl App {
             self.list_mut().find.clear();
             self.list_mut().refilter();
             self.sync_doc();
+        } else if self.tab == Tab::Activity {
+            self.switch(Tab::Prs as usize);
         }
     }
 
@@ -1112,8 +1118,13 @@ impl App {
         self.zoom = false;
         self.doc_act = Act::Info;
         self.sync_doc();
-        if !self.list().loaded && !self.list().loading {
-            self.load(self.tab, false);
+        let prs = self.tab.bar() == Tab::Prs;
+        let shown = [Some(self.tab.bar()), prs.then_some(Tab::Activity)];
+        for tab in shown.into_iter().flatten() {
+            let list = &self.lists[tab as usize];
+            if !list.loaded && !list.loading {
+                self.load(tab, false);
+            }
         }
     }
 
@@ -1141,6 +1152,9 @@ impl App {
     }
 
     fn act(&mut self, act: Act) {
+        if self.tab == Tab::Activity && matches!(act, Act::Filter | Act::State) {
+            self.switch(Tab::Prs as usize); // the header shows its values
+        }
         match act {
             Act::Quit => self.quit = true,
             Act::Help => self.modal = Some(Modal::Help),
@@ -1220,10 +1234,7 @@ impl App {
                 if self.repos.is_none() {
                     self.load_repos(None);
                 }
-                self.load(self.tab, false);
-                if self.tab == Tab::Prs {
-                    self.load(Tab::Activity, false);
-                }
+                self.load_screen(self.tab);
                 if self.detail_focus {
                     self.refresh_doc();
                 }
@@ -1925,8 +1936,10 @@ impl App {
             return self.error(text);
         }
         self.excluded = teams;
-        if self.list().filters.iter().any(|f| f.1 == api::MY_TEAMS) {
-            self.reset();
+        self.load(Tab::Activity, false);
+        let mut filters = self.lists[Tab::Prs as usize].filters.iter();
+        if filters.any(|f| f.1 == api::MY_TEAMS) {
+            self.load(Tab::Prs, false);
         } else {
             self.info("saved; applies to the filter Review requested: my teams");
         }
@@ -2133,7 +2146,8 @@ impl App {
                 ..List::default()
             };
         }
-        self.reset();
+        self.sync_doc();
+        self.load_screen(self.tab);
     }
 
     fn apply(&mut self, pick: Pick, chosen: Vec<Choice>) {
@@ -3136,6 +3150,33 @@ mod tests {
         let source = reviewing().source;
         app.feed_doc(false, Ok(source));
         assert_eq!(app.doc.thread_at_cursor(), Some(0));
+    }
+
+    #[test]
+    fn activity_is_a_panel_of_the_pull_requests() {
+        let mut app = app();
+        app.listed(Tab::Prs, 0, false, page(&[1]));
+        app.feed(Tab::Activity, false, events(&[("a", 2, false)]));
+        press(&mut app, KeyCode::Char('5'));
+        assert_eq!(app.current().unwrap().id(), "o/r#2");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.tab, Tab::Prs);
+        assert_eq!(app.current().unwrap().id(), "o/r#1");
+        // Esc leaves the document first.
+        press(&mut app, KeyCode::Char('5'));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.tab == Tab::Activity && !app.detail_focus);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.tab, Tab::Issues);
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(app.tab, Tab::Prs);
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(app.tab, Tab::Runs);
+        // Filters are those of the pull requests.
+        press(&mut app, KeyCode::Char('5'));
+        press(&mut app, KeyCode::Char('f'));
+        assert!(app.tab == Tab::Prs && matches!(app.modal, Some(Modal::Picker(_))));
     }
 
     #[test]

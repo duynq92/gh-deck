@@ -98,27 +98,32 @@ fn draw_body(frame: &mut Frame, app: &mut App, body: Rect) {
     if app.zoom && app.detail_focus {
         return draw_doc(frame, app, body);
     }
-    let split = if app.tab == Tab::Prs && body.width >= 110 {
-        // Reading the changes matters most.
+    let split = if body.width >= 110 {
+        // Reading the content matters most.
         Layout::horizontal([Constraint::Ratio(1, 3), Constraint::Fill(1)])
-    } else if app.tab == Tab::Activity && body.width >= 110 {
-        Layout::horizontal([Constraint::Percentage(42), Constraint::Fill(1)])
-    } else if body.width >= 180 {
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
     } else if body.height >= 24 {
         // Stacked panes give columns and code the full width.
         let list = if app.detail_focus { 25 } else { 55 };
         Layout::vertical([Constraint::Percentage(list), Constraint::Fill(1)])
-    } else if body.width >= 120 && !app.detail_focus {
-        Layout::horizontal([Constraint::Percentage(62), Constraint::Fill(1)])
     } else if app.detail_focus {
         return draw_doc(frame, app, body);
     } else {
-        return draw_list(frame, app, body);
+        return draw_lists(frame, app, body);
     };
     let [list, doc] = split.areas(body);
-    draw_list(frame, app, list);
+    draw_lists(frame, app, list);
     draw_doc(frame, app, doc);
+}
+
+/// The activity is below the pull requests, or instead of them in a low area.
+fn draw_lists(frame: &mut Frame, app: &mut App, area: Rect) {
+    if app.tab.bar() != Tab::Prs || area.height < 16 {
+        return draw_list(frame, app, app.tab, area);
+    }
+    let [prs, activity] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Percentage(40)]).areas(area);
+    draw_list(frame, app, Tab::Prs, prs);
+    draw_list(frame, app, Tab::Activity, activity);
 }
 
 #[derive(Clone, Copy)]
@@ -149,7 +154,8 @@ fn summary(chosen: &[Choice], longest: usize) -> String {
 /// Tabs on the left, what is shown on the right, always on one row.
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let width = area.width as usize;
-    let list = app.list();
+    let shown = app.tab.bar();
+    let list = &app.lists[shown as usize];
     let values: Vec<(&str, &[Choice], char)> = SCOPE
         .keys
         .iter()
@@ -157,9 +163,9 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             let chosen = match k.act {
                 Act::Org => &app.orgs,
                 Act::Repo => &app.scope,
-                Act::Filter if api::filters(app.tab, &[]).is_empty() => return None,
+                Act::Filter if api::filters(shown, &[]).is_empty() => return None,
                 Act::Filter => &list.filters,
-                _ if api::states(app.tab).is_empty() => return None,
+                _ if api::states(shown).is_empty() => return None,
                 _ => &list.states,
             };
             Some((k.label, chosen.as_slice(), k.key))
@@ -167,19 +173,19 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         .collect();
     let tabs = |size: TabSize| {
         let mut spans = Vec::new();
-        for (i, tab) in Tab::ALL.into_iter().enumerate() {
+        for (i, tab) in Tab::BAR.into_iter().enumerate() {
             let new = match (tab, app.unread.len()) {
-                (Tab::Activity, n) if n > 0 => format!("({n}) "),
+                (Tab::Prs, n) if n > 0 => format!("●{n} "),
                 _ => String::new(),
             };
             let name = match size {
                 TabSize::Full => format!(" {} {new}", tab.title()),
                 TabSize::Short => format!(" {} {new}", tab.short()),
-                TabSize::Keys if tab != app.tab && !new.is_empty() => new,
-                TabSize::Keys if tab != app.tab => " ".to_string(),
+                TabSize::Keys if tab != shown && !new.is_empty() => new,
+                TabSize::Keys if tab != shown => " ".to_string(),
                 TabSize::Tiny | TabSize::Keys => format!("{} {new}", tab.tiny()),
             };
-            let style = if tab == app.tab {
+            let style = if tab == shown {
                 Style::new()
                     .fg(Color::Black)
                     .bg(ACCENT)
@@ -247,10 +253,12 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(right, area);
 }
 
-fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
-    let mut block = pane(!app.detail_focus && app.modal.is_none());
-    let list = app.list();
-    let count = if app.tab == Tab::Activity && list.find.is_empty() {
+fn draw_list(frame: &mut Frame, app: &mut App, tab: Tab, area: Rect) {
+    let active = tab == app.tab;
+    let finding = app.finding && active;
+    let mut block = pane(active && !app.detail_focus && app.modal.is_none());
+    let list = &app.lists[tab as usize];
+    let count = if tab == Tab::Activity && list.find.is_empty() {
         list.view.len().to_string() // without hidden bots
     } else if !list.find.is_empty() {
         format!("{}/{}", list.view.len(), list.items.len())
@@ -260,38 +268,52 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
         list.items.len().to_string()
     };
     let loading = if list.loading { " · loading…" } else { "" };
-    block = block.title(Line::styled(
-        format!(" {} ({count}){loading} ", app.tab.title()),
-        BOLD,
-    ));
-    if app.finding || !list.find.is_empty() {
+    let mut title = vec![Span::raw(" ")];
+    if !active {
+        title.push(key(&(tab as usize + 1).to_string()));
+        title.push(Span::raw(" "));
+    }
+    let name = format!("{} ({count})", tab.title());
+    title.push(Span::styled(name, BOLD));
+    if tab == Tab::Activity && !app.unread.is_empty() {
+        title.push(Span::styled(format!(" ●{}", app.unread.len()), KEY));
+    }
+    title.push(Span::raw(format!("{loading} ")));
+    block = block.title(Line::from(title));
+    if finding || !list.find.is_empty() {
         let mut spans = vec![Span::raw(" "), key("/"), Span::raw(" Find: ")];
         spans.push(Span::styled(clean(&list.find).into_owned(), BOLD));
-        if app.finding {
+        if finding {
             spans.push(Span::styled("▏", KEY));
             spans.extend(hints(&[("Enter", "Keep"), ("Esc", "Clear")]).spans);
         }
         spans.push(Span::raw(" "));
         block = block.title_top(Line::from(spans).right_aligned());
     }
-    block = block.title_bottom(hints(&[
-        ("j/k", "Move"),
-        ("g/G", "Top/End"),
-        ("Enter", "Open"),
-    ]));
+    if active {
+        let mut keys = vec![("j/k", "Move"), ("Enter", "Open")];
+        match tab {
+            Tab::Prs => keys.push(("5", "Activity")),
+            Tab::Activity => keys.push(("Esc", "Pull requests")),
+            _ => keys.push(("g/G", "Top/End")),
+        }
+        block = block.title_bottom(hints(&keys));
+    }
     let mut inner = block.inner(area);
     frame.render_widget(block, area);
-    let columns = Columns::new(app.tab, inner.width as usize, app.scope.len() == 1);
+    let columns = Columns::new(tab, inner.width as usize, app.scope.len() == 1);
     if inner.height > 3 {
         let header = Rect { height: 1, ..inner };
-        frame.render_widget(columns.header(app.tab).style(HEAD), header);
+        frame.render_widget(columns.header(tab).style(HEAD), header);
         inner.y += 1;
         inner.height -= 1;
     }
     let height = inner.height as usize;
-    app.list_height = height;
+    if active {
+        app.list_height = height;
+    }
 
-    let list = &mut app.lists[app.tab as usize];
+    let list = &mut app.lists[tab as usize];
     list.top = list
         .top
         .min(list.sel)
@@ -316,10 +338,11 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
         .map(|(n, &i)| {
             let unread = match &list.items[i] {
                 Item::Event(e) => app.unread.contains(&e.key),
-                item => app.tab == Tab::Prs && app.unread_prs.contains(&item.id()),
+                item => tab == Tab::Prs && app.unread_prs.contains(&item.id()),
             };
             let line = columns.row(&list.items[i], unread);
-            if n == list.sel { selected(line) } else { line }
+            let here = active && n == list.sel;
+            if here { selected(line) } else { line }
         })
         .collect();
     frame.render_widget(Paragraph::new(rows), inner);
@@ -368,10 +391,15 @@ impl Columns {
             c.title = width.saturating_sub(c.used());
             return c;
         }
+        let wide = width >= 70;
         let mut c = Columns {
-            state: if ticket { 6 } else { 11 },
+            state: match (wide, ticket) {
+                (false, _) => 1,
+                (_, true) => 6,
+                _ => 11,
+            },
             repo: if scoped { 0 } else { (width / 6).min(22) },
-            id: if ticket { 6 } else { (width / 6).min(16) },
+            id: if ticket { 6 } else { (width / 6).clamp(8, 16) },
             checks: 0,
             title: 0,
             reviewers: 0,
@@ -518,7 +546,10 @@ impl Columns {
         };
         let date = api::date(item.updated());
         let mut s = Vec::new();
-        let letter = state.get(..1).unwrap_or("").to_uppercase();
+        let letter = match item {
+            Item::Run(_) => run_mark(state).to_string(),
+            _ => state.get(..1).unwrap_or("").to_uppercase(),
+        };
         let name = if self.state > 1 { state } else { &letter };
         cell(&mut s, name, self.state, state_style(state));
         cell(&mut s, repo, self.repo, Style::new().fg(Color::Blue));
@@ -629,6 +660,16 @@ fn check_mark(state: Option<&str>) -> (&'static str, Style) {
         Some(_) => ("●", Color::Yellow),
     };
     (mark, Style::new().fg(color))
+}
+
+/// State of a run where there is no room for its name.
+fn run_mark(state: &str) -> &'static str {
+    match state {
+        "success" => "✓",
+        "failure" | "timed_out" | "startup_failure" => "✗",
+        "in_progress" | "queued" | "pending" | "waiting" | "requested" | "action_required" => "●",
+        _ => "-",
+    }
 }
 
 fn state_style(state: &str) -> Style {
@@ -1028,7 +1069,7 @@ fn draw_confirm(frame: &mut Frame, label: &str) {
 fn draw_help(frame: &mut Frame, tab: Tab) {
     let mut lines: Vec<Line> = Vec::new();
     let navigation: &[(&str, &str)] = &[
-        ("1-4/Tab", "Switch tab"),
+        ("1-4/Tab", "Tab, 5 Activity"),
         ("j/k", "Move or scroll"),
         ("g/G", "Top/End"),
         ("Space/PgUp", "Page"),
@@ -1333,11 +1374,10 @@ mod tests {
                 &[
                     "[1]PR",
                     "[4]",
-                    "[5]",
-                    "[o]Org:2",
-                    "[p]Repo:",
-                    "[f]Filter:3",
-                    "[s]State:",
+                    "[o] Org:2",
+                    "[p] Repo:",
+                    "[f] Filter:3",
+                    "[s] State:",
                 ][..],
             ),
             (
@@ -1413,6 +1453,43 @@ mod tests {
             ] {
                 assert!(first.contains(part), "{width}: {part} missing in {first}");
             }
+        }
+    }
+
+    #[test]
+    fn every_tab_gives_the_list_a_third() {
+        let mut app = App::new(mpsc::channel().0, None);
+        for width in [110, 150, 190] {
+            let mut edges = Vec::new();
+            for tab in Tab::ALL {
+                app.tab = tab;
+                let text = screen(&mut app, width, 30);
+                let row: Vec<char> = text.lines().nth(1).unwrap().chars().collect();
+                edges.push(row.iter().position(|c| *c == '╮').unwrap());
+            }
+            assert!(edges.iter().all(|e| *e == edges[0]), "{width}: {edges:?}");
+            assert_eq!(edges[0], (width as usize + 1) / 3, "{width}");
+        }
+    }
+
+    #[test]
+    fn activity_is_below_the_pull_requests() {
+        let mut app = App::new(mpsc::channel().0, None);
+        for (w, h) in [(80, 24), (83, 57), (150, 40)] {
+            for (tab, other) in [
+                (Tab::Prs, "[5] Activity (0)"),
+                (Tab::Activity, "[1] Pull Requests (0)"),
+            ] {
+                app.tab = tab;
+                let text = screen(&mut app, w, h);
+                let row = |s: &str| text.lines().position(|l| l.contains(s));
+                assert!(row(other).is_some(), "{w}x{h} {other}\n{text}");
+                assert!(row("Pull Requests (0)") < row("Activity (0)"));
+                let first = text.lines().next().unwrap();
+                assert!(first.contains("State:") && !first.contains("[5]"));
+            }
+            app.tab = Tab::Issues;
+            assert!(!screen(&mut app, w, h).contains("Activity ("));
         }
     }
 
