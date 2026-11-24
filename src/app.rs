@@ -1,11 +1,12 @@
 //! Application state and key handling.
 
-use crate::api::{self, Candidates, Choice, Detail, Item, Page, Query, Repos, Reviews};
+use crate::api::{self, Candidates, Choice, Detail, Item, Page, PrText, Query, Repos, Reviews};
 use crate::config;
 use crate::doc::Doc;
 use crate::form::{self, Form};
 use crate::gh::{self, Cmd, GhError, Result};
 use crate::keys::{self, Act, Tab};
+use crate::tasks;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -38,6 +39,12 @@ pub enum Msg {
         repo: String,
         number: u64,
         result: Result<Candidates>,
+    },
+    Text {
+        job: u64,
+        act: Act,
+        item: Box<Item>,
+        result: Result<PrText>,
     },
     Done {
         tab: Tab,
@@ -94,6 +101,12 @@ pub enum Pick {
         number: u64,
         requested: Vec<String>,
     },
+    /// Checkboxes of a description; values are offsets into `body`.
+    Tasks {
+        repo: String,
+        number: u64,
+        body: String,
+    },
 }
 
 pub struct Picker {
@@ -118,6 +131,7 @@ impl Picker {
                 | Pick::State
                 | Pick::Exclude
                 | Pick::Reviewers { .. }
+                | Pick::Tasks { .. }
         )
     }
 
@@ -152,7 +166,10 @@ impl Picker {
             (false, true) => {
                 let mut one = vec![self.view().get(self.sel)?.1.clone()];
                 // Adding one more must not drop the others.
-                if matches!(self.pick, Pick::Exclude | Pick::Reviewers { .. }) {
+                if matches!(
+                    self.pick,
+                    Pick::Exclude | Pick::Reviewers { .. } | Pick::Tasks { .. }
+                ) {
                     one.extend(self.marked.iter().cloned());
                 }
                 one
@@ -416,7 +433,7 @@ impl App {
         let tab = self.tab;
         self.spawn(move || Msg::Done {
             tab,
-            result: gh::run(&cmd.args, cmd.stdin.as_deref(), gh::JSON),
+            result: gh::execute(&cmd),
             label: cmd.label,
             form,
         });
@@ -533,7 +550,24 @@ impl App {
                     Err(e) => self.error(e),
                 }
             }
-            Msg::Doc { .. } | Msg::Workflows { .. } | Msg::Reviewers { .. } => {}
+            Msg::Text {
+                job,
+                act,
+                item,
+                result,
+            } if job == self.pick_job => {
+                self.busy = None;
+                match result {
+                    Ok(text) if !text.mine => self.error("only your own pull requests"),
+                    Ok(text) if self.modal.is_none() => {
+                        self.finding = false;
+                        self.edit_text(act, *item, text);
+                    }
+                    Ok(_) => {}
+                    Err(e) => self.error(e),
+                }
+            }
+            Msg::Doc { .. } | Msg::Workflows { .. } | Msg::Reviewers { .. } | Msg::Text { .. } => {}
             Msg::Done {
                 tab,
                 label,
@@ -884,6 +918,25 @@ impl App {
                     number,
                 });
             }
+            Act::Title | Act::Description | Act::Tasks => {
+                let Item::Ticket(t) = &item else { return };
+                if !self.is_mine(&item) {
+                    return self.error("you can edit only PRs opened by you");
+                }
+                if let Some(busy) = &self.busy {
+                    self.status = Some(Status::Error(format!("still running: {busy}")));
+                    return;
+                }
+                self.busy = Some(format!("Loading {}", item.id()));
+                self.pick_job += 1;
+                let (job, repo, number) = (self.pick_job, t.repo.clone(), t.number);
+                self.spawn(move || Msg::Text {
+                    job,
+                    act,
+                    item: Box::new(item),
+                    result: api::pr_text(&repo, number),
+                });
+            }
             Act::Ready if !self.is_mine(&item) => {
                 self.error("you can mark only PRs opened by you as ready");
             }
@@ -932,6 +985,40 @@ impl App {
             (Item::Ticket(t), Some(r)) => t.author.as_ref() == Some(&r.login),
             (Item::Ticket(_), None) => true,
             _ => false,
+        }
+    }
+
+    /// Edit what is on GitHub now, not the copy in the list.
+    fn edit_text(&mut self, act: Act, mut item: Item, text: PrText) {
+        let Item::Ticket(t) = &mut item else { return };
+        if act == Act::Tasks {
+            return self.pick_tasks(t.repo.clone(), t.number, text.body);
+        }
+        t.title = text.title;
+        t.body = text.body;
+        let repo = t.repo.clone();
+        if let Some(form) = Form::new(Tab::Prs, act, &repo, Some(item), "") {
+            self.modal = Some(Modal::Form(Box::new(form)));
+        }
+    }
+
+    fn pick_tasks(&mut self, repo: String, number: u64, body: String) {
+        let tasks = tasks::find(&body);
+        if tasks.is_empty() {
+            let text = format!("{repo}#{number} has no checkboxes; [E] edits the description");
+            return self.error(text);
+        }
+        let marked = tasks.iter().filter(|t| t.done);
+        let marked = marked.map(|t| t.mark.to_string()).collect();
+        let items = tasks
+            .into_iter()
+            .map(|t| (t.text, t.mark.to_string()))
+            .collect();
+        let title = format!("Checkboxes of {repo}#{number}");
+        let pick = Pick::Tasks { repo, number, body };
+        self.picker(title, items, 0, pick);
+        if let Some(Modal::Picker(p)) = &mut self.modal {
+            p.marked = marked;
         }
     }
 
@@ -1211,6 +1298,24 @@ impl App {
                     None => self.info("reviewers unchanged"),
                 }
             }
+            Pick::Tasks { repo, number, body } => {
+                let ticked: Vec<usize> = chosen.iter().filter_map(|c| c.1.parse().ok()).collect();
+                let new = tasks::apply(&body, &ticked);
+                if new == body {
+                    return self.info("checkboxes unchanged");
+                }
+                let done = tasks::find(&body).into_iter().filter(|t| t.done);
+                let cleared = done.filter(|t| !ticked.contains(&t.mark)).count();
+                let mut cmd = api::edit_body(&repo, number, &body, new);
+                cmd.label = format!("Update checkboxes of {repo}#{number}");
+                if cleared > 0 {
+                    // One key clears them all, so ask.
+                    cmd.label += &format!(" (unticks {cleared})");
+                    self.modal = Some(Modal::Confirm(cmd));
+                } else {
+                    self.execute(cmd, None);
+                }
+            }
             Pick::Target(_) | Pick::Workflow(_) => {}
         }
     }
@@ -1222,7 +1327,8 @@ impl App {
             | Pick::Filter
             | Pick::State
             | Pick::Exclude
-            | Pick::Reviewers { .. } => {}
+            | Pick::Reviewers { .. }
+            | Pick::Tasks { .. } => {}
             Pick::Target(act) => self.target(act, value),
             Pick::Workflow(repo) => {
                 if let Some(form) = Form::new(self.tab, Act::Trigger, &repo, None, &value) {
@@ -1505,6 +1611,29 @@ mod tests {
         press(&mut app, KeyCode::Char('!'));
         assert!(matches!(&app.modal, Some(Modal::Message(t)) if t == "a long error"));
         press(&mut app, KeyCode::Esc);
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn ticking_keeps_other_marks_and_unticking_asks() {
+        let body = "- [x] a\n- [ ] b\n".to_string();
+        let mut app = app();
+        app.pick_tasks("o/r".into(), 7, body.clone());
+        press(&mut app, KeyCode::Char(' ')); // untick a
+        press(&mut app, KeyCode::Enter);
+        let Some(Modal::Confirm(cmd)) = app.modal.take() else {
+            panic!("no confirmation");
+        };
+        assert_eq!(cmd.stdin.as_deref(), Some("- [ ] a\n- [ ] b\n"));
+        assert!(cmd.guard.is_some_and(|g| g.expected == body));
+        app.pick_tasks("o/r".into(), 7, body);
+        press(&mut app, KeyCode::Down);
+        let Some(Modal::Picker(p)) = &app.modal else {
+            panic!("no picker");
+        };
+        assert_eq!(p.chosen().unwrap().len(), 2);
+        app.modal = None;
+        app.pick_tasks("o/r".into(), 7, "no boxes".into());
         assert!(app.modal.is_none());
     }
 }

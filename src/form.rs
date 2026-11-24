@@ -71,6 +71,12 @@ impl Form {
                     field("Delete branch", Kind::Toggle(false)),
                 ],
             ),
+            (Act::Title, Some(Item::Ticket(t))) => {
+                ("Title of", vec![field("Title", line(&t.title))])
+            }
+            (Act::Description, Some(Item::Ticket(t))) => {
+                ("Description of", vec![field("Markdown", area(&t.body))])
+            }
             (Act::Labels, Some(Item::Ticket(t))) => (
                 "Labels of",
                 vec![field("Labels, one per line", area(&t.labels.join("\n")))],
@@ -127,6 +133,12 @@ impl Form {
             ),
             _ => return None,
         };
+        let mut fields = fields;
+        if act == Act::Description
+            && let Some(Kind::Text { cur, .. }) = fields.first_mut().map(|f| &mut f.kind)
+        {
+            *cur = 0; // long text is read from the top
+        }
         let target = item.as_ref().map_or_else(|| repo.to_string(), Item::id);
         Some(Form {
             title: format!("{verb} {target}"),

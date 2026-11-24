@@ -31,7 +31,7 @@ Press `?` in the app for the current tab's shortcuts.
 | Where | Keys |
 |---|---|
 | Everywhere | `1`-`4`/`Tab` tabs, `j`/`k` move, `g`/`G` top/end, `Enter` open, `Esc` back, `o` organization, `p` repo, `f` filter, `s` state, `/` find, `>` more, `R` refresh, `?` help, `!` last message, `q` quit |
-| Pull requests | `i` info, `d` diff, `n`/`N` next/previous file, `h` checks, `w` web, `a` approve, `x` request changes, `c` comment, `v` reviewers and `r` mark draft ready (your own PRs), `m` merge, `X` close/reopen, `b` checkout, `t` excluded teams |
+| Pull requests | `i` info, `d` diff, `n`/`N` next/previous file, `h` checks, `w` web, `a` approve, `x` request changes, `c` comment, `v` reviewers, `r` mark draft ready, `e` title, `E` description and `T` checkboxes (your own PRs), `m` merge, `X` close/reopen, `b` checkout, `t` excluded teams |
 | Issues | `i` info, `w` web, `n` new, `c` comment, `l` labels, `a` assignees, `X` close/reopen |
 | Releases | `i` info, `w` web, `D` download, `n` new, `e` edit, `P` publish, `X` delete |
 | Actions | `i` jobs, `l` log, `L` failed log, `w` web, `r` rerun all, `F` rerun failed, `x` cancel, `t` trigger workflow |
@@ -51,8 +51,11 @@ involving me, and review requested from my teams. `t` leaves noisy teams out of
 *my teams*; pull requests that ask you or another of your teams still show. The
 list is saved in `~/.config/ghdeck/excluded-teams` (or `$XDG_CONFIG_HOME`).
 
-Close, delete, publish, rerun, cancel, mark ready and reviewer changes ask for `y` first. Merge and review
-actions open a form that is only sent with `Ctrl+S`.
+Close, delete, publish, rerun, cancel, mark ready and reviewer changes ask for `y` first. Merge, review
+and text actions open a form that is only sent with `Ctrl+S`.
+
+Titles and descriptions are loaded when you press the key. Saving is refused when
+they changed on GitHub meanwhile. Ticking checkboxes saves at once; unticking asks.
 
 ## Design
 
