@@ -1,10 +1,10 @@
 //! Drawing. Every label that has a shortcut shows it.
 
-use crate::api::{self, Item};
+use crate::api::{self, Item, Reviews};
 use crate::app::{App, Modal, Picker, Status};
-use crate::doc::clean;
+use crate::doc::{GUTTER, Kind as LineKind, clean};
 use crate::form::{Form, Kind, line_at};
-use crate::keys::{self, Act, GLOBAL, Group, Tab};
+use crate::keys::{self, Act, GLOBAL, Group, SCOPE, Tab};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -14,6 +14,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const ACCENT: Color = Color::Cyan;
 const KEY: Style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+const HEAD: Style = Style::new()
+    .fg(Color::Gray)
+    .add_modifier(Modifier::BOLD.union(Modifier::UNDERLINED));
 const DIM: Style = Style::new().fg(Color::DarkGray);
 const BOLD: Style = Style::new().add_modifier(Modifier::BOLD);
 
@@ -66,30 +69,27 @@ fn fit(text: &str, width: usize) -> String {
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let actions = action_lines(app, frame.area().width);
-    let [tabs, context, body, bar, status] = Layout::vertical([
-        Constraint::Length(1),
+    let screen = frame.area();
+    let rows = flow(app, screen.width, 2);
+    // Boxes when they leave enough room for content, one-line groups otherwise.
+    let boxed = rows.len() as u16 * 3 <= screen.height / 5;
+    let rows = if boxed {
+        rows
+    } else {
+        flow(app, screen.width, 0)
+    };
+    let height = rows.len() as u16 * if boxed { 3 } else { 1 };
+    let [header, body, bar, status] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(3),
-        Constraint::Length(actions.len() as u16),
+        Constraint::Length(height),
         Constraint::Length(1),
     ])
-    .areas(frame.area());
+    .areas(screen);
 
-    draw_tabs(frame, app, tabs);
-    draw_context(frame, app, context);
-    if body.width >= 100 {
-        let [left, right] =
-            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .areas(body);
-        draw_list(frame, app, left);
-        draw_doc(frame, app, right);
-    } else if app.detail_focus {
-        draw_doc(frame, app, body);
-    } else {
-        draw_list(frame, app, body);
-    }
-    frame.render_widget(Paragraph::new(actions), bar);
+    draw_header(frame, app, header);
+    draw_body(frame, app, body);
+    draw_actions(frame, app, bar, &rows, boxed);
     draw_status(frame, app, status);
 
     match &app.modal {
@@ -101,73 +101,93 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
-fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
-    let mut spans = Vec::new();
-    for (i, tab) in Tab::ALL.into_iter().enumerate() {
-        let style = if tab == app.tab {
-            Style::new()
-                .fg(ACCENT)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-        } else {
-            Style::new()
-        };
-        spans.extend([
-            Span::raw(" "),
-            key(&(i + 1).to_string()),
-            Span::raw(" "),
-            Span::styled(tab.title(), style),
-            Span::raw(" "),
-        ]);
-    }
-    frame.render_widget(Line::from(spans), area);
+fn draw_body(frame: &mut Frame, app: &mut App, body: Rect) {
+    let split = if body.width >= 180 {
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+    } else if body.height >= 24 {
+        // Stacked panes give columns and code the full width.
+        let list = if app.detail_focus { 25 } else { 55 };
+        Layout::vertical([Constraint::Percentage(list), Constraint::Fill(1)])
+    } else if body.width >= 120 && !app.detail_focus {
+        Layout::horizontal([Constraint::Percentage(62), Constraint::Fill(1)])
+    } else if app.detail_focus {
+        return draw_doc(frame, app, body);
+    } else {
+        return draw_list(frame, app, body);
+    };
+    let [list, doc] = split.areas(body);
+    draw_list(frame, app, list);
+    draw_doc(frame, app, doc);
 }
 
-fn draw_context(frame: &mut Frame, app: &App, area: Rect) {
+/// Tabs on the left, what is shown on the right, always on one row.
+fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
+    let width = area.width as usize;
     let list = app.list();
-    let scope = app.scope.as_deref().unwrap_or("All repositories");
-    let mut spans = vec![
-        Span::raw(" "),
-        key("p"),
-        Span::raw(" Repo: "),
-        Span::styled(scope, BOLD),
-    ];
-    let filters = api::filters(app.tab);
-    let ticket = matches!(app.tab, Tab::Prs | Tab::Issues);
-    // Ownership means nothing once a single repository is chosen.
-    if filters.len() > 1 && (ticket || app.scope.is_none()) {
-        let name = match (list.filter, &app.scope) {
-            (n, Some(_)) if matches!(filters[n].1, "" | api::MINE) => "Everything",
-            (n, _) => filters[n].0,
+    let mut values: Vec<(&str, &str, char)> = Vec::new();
+    for k in SCOPE.keys {
+        let value = match k.act {
+            Act::Org => app.org.as_deref().unwrap_or("All"),
+            Act::Repo => app.scope.as_deref().unwrap_or("All"),
+            Act::Filter if api::filters(app.tab, &[]).is_empty() => continue,
+            Act::Filter => list.filter.as_ref().map_or("All", |f| f.0.as_str()),
+            _ if api::states(app.tab).len() < 2 => continue,
+            _ => api::states(app.tab)[list.state].0,
         };
-        spans.extend([
-            Span::raw("  "),
-            key("f"),
-            Span::raw(" Filter: "),
-            Span::styled(name, BOLD),
-        ]);
+        values.push((k.label, value, k.key));
     }
-    let states = api::states(app.tab);
-    if states.len() > 1 {
-        spans.extend([
-            Span::raw("  "),
-            key("s"),
-            Span::raw(" State: "),
-            Span::styled(states[list.state].0, BOLD),
-        ]);
-    }
-    if app.finding || !list.find.is_empty() {
-        spans.extend([
-            Span::raw("  "),
-            key("/"),
-            Span::raw(" Find: "),
-            Span::styled(list.find.as_str(), BOLD),
-        ]);
-        if app.finding {
-            spans.push(Span::styled("▏", KEY));
-            spans.extend(hints(&[("Enter", "Keep"), ("Esc", "Clear")]).spans);
+    let tabs = |short: bool| {
+        let mut spans = Vec::new();
+        for (i, tab) in Tab::ALL.into_iter().enumerate() {
+            let name = if short { tab.short() } else { tab.title() };
+            let style = if tab == app.tab {
+                Style::new()
+                    .fg(Color::Black)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::new()
+            };
+            spans.push(key(&(i + 1).to_string()));
+            spans.push(Span::styled(format!(" {name} "), style));
         }
-    }
-    frame.render_widget(Line::from(spans), area);
+        Line::from(spans)
+    };
+    let right = |labels: bool, longest: usize| {
+        let mut spans = Vec::new();
+        for (label, value, k) in &values {
+            spans.push(key(&k.to_string()));
+            if labels {
+                spans.push(Span::styled(format!(" {label}:"), DIM));
+            }
+            let text = fit(value, clean(value).width().min(longest));
+            let style = if *value == "All" {
+                BOLD
+            } else {
+                Style::new().fg(Color::Green).add_modifier(Modifier::BOLD)
+            };
+            spans.push(Span::styled(text, style));
+            spans.push(Span::raw(" "));
+        }
+        Line::from(spans)
+    };
+    // The widest variant that fits; values shrink before anything disappears.
+    let (left, right) = [(false, true, 18), (true, true, 12), (true, false, 12)]
+        .into_iter()
+        .flat_map(|(short, labels, min)| {
+            [40, 30, 24, 18, 12].map(move |n| (short, labels, n, n >= min))
+        })
+        .filter(|v| v.3)
+        .map(|(short, labels, n, _)| (tabs(short), right(labels, n)))
+        .find(|(l, r)| l.width() + r.width() < width)
+        .unwrap_or_else(|| {
+            let room = width.saturating_sub(tabs(true).width() + values.len() * 4 + 1);
+            (tabs(true), right(false, (room / values.len()).max(3)))
+        });
+    frame.render_widget(left, area);
+    let len = (right.width() as u16).min(area.width);
+    let area = Rect::new(area.right() - len, area.y, len, area.height);
+    frame.render_widget(right, area);
 }
 
 fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -185,13 +205,30 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
         format!(" {} ({count}){loading} ", app.tab.title()),
         BOLD,
     ));
+    if app.finding || !list.find.is_empty() {
+        let mut spans = vec![Span::raw(" "), key("/"), Span::raw(" Find: ")];
+        spans.push(Span::styled(clean(&list.find).into_owned(), BOLD));
+        if app.finding {
+            spans.push(Span::styled("▏", KEY));
+            spans.extend(hints(&[("Enter", "Keep"), ("Esc", "Clear")]).spans);
+        }
+        spans.push(Span::raw(" "));
+        block = block.title_top(Line::from(spans).right_aligned());
+    }
     block = block.title_bottom(hints(&[
         ("j/k", "Move"),
         ("g/G", "Top/End"),
         ("Enter", "Open"),
     ]));
-    let inner = block.inner(area);
+    let mut inner = block.inner(area);
     frame.render_widget(block, area);
+    let columns = Columns::new(app.tab, inner.width as usize, app.scope.is_some());
+    if inner.height > 3 {
+        let header = Rect { height: 1, ..inner };
+        frame.render_widget(columns.header(app.tab).style(HEAD), header);
+        inner.y += 1;
+        inner.height -= 1;
+    }
     let height = inner.height as usize;
     app.list_height = height;
 
@@ -211,7 +248,6 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(Paragraph::new(text).style(DIM).centered(), inner);
         return;
     }
-    let width = inner.width as usize;
     let rows: Vec<Line> = list
         .view
         .iter()
@@ -219,80 +255,199 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
         .skip(list.top)
         .take(height)
         .map(|(n, &i)| {
-            let line = item_line(&list.items[i], width, app.scope.is_some());
-            if n == list.sel {
-                line.patch_style(Style::new().add_modifier(Modifier::REVERSED))
-            } else {
-                line
-            }
+            let line = columns.row(&list.items[i]);
+            if n == list.sel { selected(line) } else { line }
         })
         .collect();
     frame.render_widget(Paragraph::new(rows), inner);
 }
 
-fn item_line(item: &Item, width: usize, scoped: bool) -> Line<'static> {
-    let state = item.state();
-    let repo = item.repo().split('/').next_back().unwrap_or("");
-    let (id, title) = match item {
-        Item::Ticket(t) => (format!("#{}", t.number), t.title.clone()),
-        Item::Release(r) => (r.tag.clone(), item.title().to_string()),
-        Item::Run(r) => (
-            r.name.clone().unwrap_or_default(),
-            format!("{} ({})", r.title, r.branch.as_deref().unwrap_or("-")),
-        ),
-    };
-    let repo_width = if scoped { 0 } else { (width / 5).min(20) };
-    let id_width = if matches!(item, Item::Ticket(_)) {
-        6
-    } else {
-        (width / 6).min(14)
-    };
-    let date = api::date(item.updated());
-    let date = date.get(5..).unwrap_or("");
-    let mut spans = vec![
-        Span::styled(fit(state, 11), state_style(state)),
-        Span::raw(" "),
-    ];
-    let mut used = 12;
-    if repo_width > 0 {
-        spans.push(Span::styled(
-            fit(repo, repo_width),
-            Style::new().fg(Color::Blue),
-        ));
-        spans.push(Span::raw(" "));
-        used += repo_width + 1;
+/// One solid bar; columns keep their colors.
+fn selected(mut line: Line<'static>) -> Line<'static> {
+    for span in &mut line.spans {
+        if span.style.fg == DIM.fg {
+            span.style.fg = Some(Color::Indexed(250));
+        }
+        span.style = span.style.add_modifier(Modifier::BOLD);
     }
-    spans.push(Span::styled(fit(&id, id_width), Style::new().fg(ACCENT)));
-    spans.push(Span::raw(" "));
-    used += id_width + 1;
-    let checks = match item {
-        Item::Ticket(t) => check_mark(t.checks.as_deref()),
-        _ => None,
-    };
-    if let Some(mark) = checks {
-        spans.push(mark);
-        used += 2;
-    }
-    let tail = if width > used + 32 {
-        date.width() + 1
-    } else {
-        0
-    };
-    spans.push(Span::raw(fit(&title, width.saturating_sub(used + tail))));
-    if tail > 0 {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(date.to_string(), DIM));
-    }
-    Line::from(spans)
+    line.style(Style::new().fg(Color::Indexed(255)).bg(Color::Indexed(238)))
 }
 
-fn check_mark(state: Option<&str>) -> Option<Span<'static>> {
-    let (mark, color) = match state? {
-        "SUCCESS" => ("✓ ", Color::Green),
-        "FAILURE" | "ERROR" => ("✗ ", Color::Red),
-        _ => ("● ", Color::Yellow),
+/// Column widths of the list; 0 hides a column.
+struct Columns {
+    state: usize,
+    repo: usize,
+    id: usize,
+    checks: usize,
+    title: usize,
+    reviewers: usize,
+    approval: usize,
+    date: usize,
+}
+
+impl Columns {
+    fn new(tab: Tab, width: usize, scoped: bool) -> Self {
+        let ticket = matches!(tab, Tab::Prs | Tab::Issues);
+        let pr = tab == Tab::Prs;
+        let mut c = Columns {
+            state: if ticket { 6 } else { 11 },
+            repo: if scoped { 0 } else { (width / 6).min(22) },
+            id: if ticket { 6 } else { (width / 6).min(16) },
+            checks: if pr { 1 } else { 0 },
+            title: 0,
+            reviewers: match width {
+                _ if !pr => 0,
+                130.. => 30,
+                100.. => 22,
+                _ => 14,
+            },
+            approval: if pr { 10 } else { 0 },
+            date: 11,
+        };
+        let used =
+            |c: &Columns| -> usize { c.widths().iter().filter(|w| **w > 0).map(|w| w + 1).sum() };
+        // Drop what matters least until the title has room.
+        if width < used(&c) + 22 {
+            c.date = 0;
+        }
+        if width < used(&c) + 18 {
+            c.repo = c.repo.min(8);
+            c.reviewers = c.reviewers.min(10);
+        }
+        c.title = width.saturating_sub(used(&c));
+        c
+    }
+
+    fn widths(&self) -> [usize; 7] {
+        [
+            self.state,
+            self.repo,
+            self.id,
+            self.checks,
+            self.reviewers,
+            self.approval,
+            self.date,
+        ]
+    }
+
+    fn header(&self, tab: Tab) -> Line<'static> {
+        let id = match tab {
+            Tab::Releases => "TAG",
+            Tab::Runs => "WORKFLOW",
+            _ => "#",
+        };
+        let mut spans = Vec::new();
+        for (name, width) in [
+            ("STATE", self.state),
+            ("REPO", self.repo),
+            (id, self.id),
+            ("C", self.checks),
+            ("TITLE", self.title),
+            ("REVIEWERS", self.reviewers),
+            ("APPROVAL", self.approval),
+            ("UPDATED", self.date),
+        ] {
+            cell(&mut spans, name, width, Style::new());
+        }
+        Line::from(spans)
+    }
+
+    fn row(&self, item: &Item) -> Line<'static> {
+        let state = item.state();
+        let repo = item.repo().split('/').next_back().unwrap_or("");
+        let (id, title) = match item {
+            Item::Ticket(t) => (format!("#{}", t.number), t.title.clone()),
+            Item::Release(r) => (r.tag.clone(), item.title().to_string()),
+            Item::Run(r) => (
+                r.name.clone().unwrap_or_default(),
+                format!("{} ({})", r.title, r.branch.as_deref().unwrap_or("-")),
+            ),
+        };
+        let reviews = match item {
+            Item::Ticket(t) => t.reviews.as_ref(),
+            _ => None,
+        };
+        let date = api::date(item.updated());
+        let mut s = Vec::new();
+        cell(&mut s, state, self.state, state_style(state));
+        cell(&mut s, repo, self.repo, Style::new().fg(Color::Blue));
+        cell(&mut s, &id, self.id, Style::new().fg(ACCENT));
+        let (mark, style) = check_mark(reviews.and_then(|r| r.checks.as_deref()));
+        cell(&mut s, mark, self.checks, style);
+        cell(&mut s, &title, self.title, Style::new());
+        if self.reviewers > 0 {
+            reviewer_cell(&mut s, reviews, self.reviewers);
+        }
+        let approval = reviews.map_or("…", |r| r.approval());
+        cell(&mut s, approval, self.approval, mark_style(approval));
+        cell(&mut s, date.get(5..).unwrap_or(""), self.date, DIM);
+        Line::from(s)
+    }
+}
+
+/// Append a padded cell and its separator.
+fn cell(spans: &mut Vec<Span<'static>>, text: &str, width: usize, style: Style) {
+    if width > 0 {
+        spans.push(Span::styled(fit(text, width), style));
+        spans.push(Span::raw(" "));
+    }
+}
+
+/// Style of a text that starts with a review mark.
+fn mark_style(text: &str) -> Style {
+    match text.chars().next() {
+        Some('✓') => Style::new().fg(Color::Green),
+        Some('✗') => Style::new().fg(Color::Red),
+        Some('●') => Style::new().fg(Color::Yellow),
+        _ => DIM,
+    }
+}
+
+/// `✓alice ●@team +2`, each reviewer in the color of their state.
+fn reviewer_cell(spans: &mut Vec<Span<'static>>, reviews: Option<&Reviews>, width: usize) {
+    let Some(reviews) = reviews else {
+        return cell(spans, "…", width, DIM);
     };
-    Some(Span::styled(mark, Style::new().fg(color)))
+    let all = &reviews.reviewers;
+    if all.is_empty() {
+        return cell(spans, "-", width, DIM);
+    }
+    let mut left = width;
+    for (n, r) in all.iter().enumerate() {
+        let text = format!("{}{} ", r.mark(), clean(&r.name));
+        let rest = all.len() - n;
+        // Keep room for the "+N" counter while more reviewers follow.
+        let reserve = if rest > 1 { 4 } else { 0 };
+        if text.trim_end().width() + reserve > left {
+            if n == 0 {
+                let room = left.saturating_sub(reserve);
+                spans.push(Span::styled(fit(&text, room), mark_style(&text)));
+                left -= room;
+                if rest > 1 {
+                    spans.push(Span::styled(fit(&format!(" +{}", rest - 1), left), DIM));
+                    left = 0;
+                }
+            } else {
+                spans.push(Span::styled(fit(&format!("+{rest}"), left), DIM));
+                left = 0;
+            }
+            break;
+        }
+        let len = text.width().min(left);
+        spans.push(Span::styled(fit(&text, len), mark_style(&text)));
+        left -= len;
+    }
+    spans.push(Span::raw(" ".repeat(left + 1)));
+}
+
+fn check_mark(state: Option<&str>) -> (&'static str, Style) {
+    let (mark, color) = match state {
+        None => return (" ", DIM),
+        Some("SUCCESS") => ("✓", Color::Green),
+        Some("FAILURE" | "ERROR") => ("✗", Color::Red),
+        Some(_) => ("●", Color::Yellow),
+    };
+    (mark, Style::new().fg(color))
 }
 
 fn state_style(state: &str) -> Style {
@@ -335,73 +490,188 @@ fn draw_doc(frame: &mut Frame, app: &mut App, area: Rect) {
     app.doc_height = height;
     app.doc.layout(inner.width);
     app.doc.scroll(0, height); // clamp after resize
-    if app.doc.len() > height {
-        let percent = (app.doc.top + height) * 100 / app.doc.len();
-        block = block.title_top(Line::from(format!(" {}% ", percent.min(100))).right_aligned());
+    let percent = if app.doc.len() > height {
+        let seen = (app.doc.top + height) * 100 / app.doc.len();
+        format!(" {}%", seen.min(100))
+    } else {
+        String::new()
+    };
+    let mut right = Vec::new();
+    if let Some((n, count, path)) = app.doc.current_file() {
+        let room = (area.width as usize).saturating_sub(40);
+        let path = fit(path, path.width().min(room));
+        let style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+        right.push(Span::styled(format!(" {path} ({n}/{count})"), style));
+    }
+    right.push(Span::raw(percent));
+    if right.iter().any(|s| s.width() > 0) {
+        right.push(Span::raw(" "));
+        block = block.title_top(Line::from(right).right_aligned());
     }
     frame.render_widget(block, area);
-    let rows: Vec<Line> = app
-        .doc
-        .visible(height)
-        .map(|(text, line)| Line::styled(text, line_style(line, app.doc.diff)))
-        .collect();
-    frame.render_widget(Paragraph::new(rows), inner);
+    for (n, row) in app.doc.visible(height).enumerate() {
+        let area = Rect::new(inner.x, inner.y + n as u16, inner.width, 1);
+        let (text, background) = doc_line(row.indent, row.text, row.kind);
+        frame.render_widget(text, area);
+        if let Some(color) = background {
+            frame.buffer_mut().set_style(area, Style::new().bg(color));
+        }
+    }
 }
 
-fn line_style(line: &str, diff: bool) -> Style {
+/// Styled text and the background of the whole row.
+fn doc_line(indent: usize, text: &str, kind: LineKind) -> (Line<'_>, Option<Color>) {
     let fg = |c| Style::new().fg(c);
-    if !diff {
-        return if line.starts_with("── ") {
-            fg(ACCENT)
-        } else {
-            Style::new()
+    if kind.is_code() {
+        let (code, background) = match kind {
+            LineKind::Add => (fg(Color::Indexed(255)), Some(Color::Indexed(22))),
+            LineKind::Del => (fg(Color::Indexed(255)), Some(Color::Indexed(52))),
+            _ => (Style::new(), None),
         };
+        let gutter = match background {
+            Some(_) => fg(Color::Indexed(250)),
+            None => DIM,
+        };
+        let line = match text.split_at_checked(GUTTER) {
+            _ if indent > 0 => Line::from(vec![
+                Span::raw(" ".repeat(indent)),
+                Span::styled(text, code),
+            ]),
+            Some((numbers, rest)) => Line::from(vec![
+                Span::styled(numbers, gutter),
+                Span::styled(rest, code),
+            ]),
+            None => Line::styled(text, code),
+        };
+        return (line, background);
     }
-    if line.starts_with("diff ") || line.starts_with("+++") || line.starts_with("---") {
-        BOLD
-    } else if line.starts_with('+') {
-        fg(Color::Green)
-    } else if line.starts_with('-') {
-        fg(Color::Red)
-    } else if line.starts_with("@@") {
-        fg(ACCENT)
-    } else {
-        Style::new()
+    match kind {
+        LineKind::Title => (Line::styled(text, BOLD), None),
+        LineKind::Heading => (
+            Line::styled(text, fg(ACCENT).add_modifier(Modifier::BOLD)),
+            None,
+        ),
+        LineKind::File => (
+            Line::styled(text, fg(Color::Indexed(255)).add_modifier(Modifier::BOLD)),
+            Some(Color::Indexed(24)),
+        ),
+        LineKind::Hunk => (Line::styled(text, fg(Color::Magenta)), None),
+        LineKind::Summary => (summary_line(text), None),
+        _ => (Line::raw(text), None),
     }
 }
 
-/// The action groups, flowing over as many lines as they need.
-fn action_lines(app: &App, width: u16) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let mut spans: Vec<Span> = Vec::new();
+/// ` M    +12     -3  path`, as written by `Doc`.
+fn summary_line(text: &str) -> Line<'_> {
+    let (Some(status), Some(add), Some(del), Some(path)) = (
+        text.get(..3),
+        text.get(3..9),
+        text.get(9..16),
+        text.get(16..),
+    ) else {
+        return Line::raw(text);
+    };
+    let color = match status.trim() {
+        "A" => Color::Green,
+        "D" => Color::Red,
+        _ => Color::Yellow,
+    };
+    Line::from(vec![
+        Span::styled(status, Style::new().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(add, Style::new().fg(Color::Green)),
+        Span::styled(del, Style::new().fg(Color::Red)),
+        Span::styled(path, BOLD),
+    ])
+}
+
+fn group_color(group: &Group) -> Color {
+    match group.name {
+        "View" => Color::Blue,
+        "Review" | "Edit" | "Run" => Color::Green,
+        "Manage" => Color::Magenta,
+        _ => Color::Gray,
+    }
+}
+
+/// Put the action groups on as few rows as possible.
+fn flow(app: &App, width: u16, border: usize) -> Vec<Vec<(&'static Group, u16)>> {
+    let mut rows: Vec<Vec<(&'static Group, u16)>> = vec![Vec::new()];
     let mut used = 0;
     for group in keys::groups(app.tab).iter().chain([&GLOBAL]) {
-        let part = group_spans(app, group);
-        let len: usize = part.iter().map(Span::width).sum();
+        let title = if border > 0 { 0 } else { group.name.len() + 3 };
+        let keys: usize = key_spans(app, group).iter().map(Span::width).sum();
+        let len = keys + title + border;
         if used > 0 && used + len > width as usize {
-            lines.push(Line::from(std::mem::take(&mut spans)));
+            rows.push(Vec::new());
             used = 0;
         }
         used += len;
-        spans.extend(part);
+        if let Some(row) = rows.last_mut() {
+            row.push((group, len as u16));
+        }
     }
-    lines.push(Line::from(spans));
-    lines
+    rows
 }
 
-fn group_spans(app: &App, group: &Group) -> Vec<Span<'static>> {
-    let mut spans = vec![Span::styled(
-        format!(" {} ", group.name.to_uppercase()),
-        Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
-    )];
+fn draw_actions(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    rows: &[Vec<(&'static Group, u16)>],
+    boxed: bool,
+) {
+    let height = if boxed { 3 } else { 1 };
+    let mut y = area.y;
+    for row in rows {
+        let mut x = area.x;
+        for (group, len) in row {
+            let color = group_color(group);
+            let place = Rect::new(x, y, *len, height).intersection(area);
+            x = x.saturating_add(*len);
+            if boxed {
+                let block = Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::new().fg(color))
+                    .title(Line::styled(
+                        format!(" {} ", group.name),
+                        Style::new().fg(color).add_modifier(Modifier::BOLD),
+                    ));
+                let inner = block.inner(place);
+                frame.render_widget(block, place);
+                frame.render_widget(Line::from(key_spans(app, group)), inner);
+            } else {
+                let badge = Style::new()
+                    .fg(Color::Black)
+                    .bg(color)
+                    .add_modifier(Modifier::BOLD);
+                let mut spans = vec![
+                    Span::styled(format!(" {} ", group.name), badge),
+                    Span::raw(" "),
+                ];
+                spans.extend(key_spans(app, group));
+                frame.render_widget(Line::from(spans), place);
+            }
+        }
+        y += height;
+    }
+}
+
+fn key_spans(app: &App, group: &Group) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
     for k in group.keys {
         let label = match (k.act, app.list().selected().map(Item::state)) {
             (Act::Toggle, Some("open" | "draft")) => "Close",
             (Act::Toggle, Some("closed")) => "Reopen",
             _ => k.label,
         };
-        spans.push(key(&k.key.to_string()));
-        spans.push(Span::raw(format!("{label} ")));
+        // Red marks what is hard to undo.
+        let risky = matches!(
+            k.act,
+            Act::Merge | Act::Toggle | Act::Delete | Act::Cancel | Act::Publish
+        );
+        let style = if risky { KEY.fg(Color::Red) } else { KEY };
+        spans.push(Span::styled(format!("[{}]", k.key), style));
+        spans.push(Span::raw(format!(" {label} ")));
     }
     spans
 }
@@ -458,7 +728,7 @@ fn draw_help(frame: &mut Frame, tab: Tab) {
     let mut more = vec![Span::raw("          ")];
     more.extend(hints(&navigation[3..]).spans);
     lines.push(Line::from(more));
-    for group in keys::groups(tab).iter().chain([&GLOBAL]) {
+    for group in keys::groups(tab).iter().chain([&SCOPE, &GLOBAL]) {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
             format!(" {}", group.name.to_uppercase()),
@@ -473,6 +743,21 @@ fn draw_help(frame: &mut Frame, tab: Tab) {
         for row in list.chunks(4) {
             lines.push(hints(row));
         }
+    }
+    if tab == Tab::Prs {
+        lines.push(Line::raw(""));
+        let marks = [
+            "✓ approved",
+            "✗ changes",
+            "● waiting",
+            "· commented",
+            "- dismissed",
+        ];
+        let mut spans = vec![Span::styled(" REVIEWERS ", Style::new().fg(ACCENT))];
+        for mark in marks {
+            spans.push(Span::styled(format!(" {mark} "), mark_style(mark)));
+        }
+        lines.push(Line::from(spans));
     }
     let block = pane(true)
         .title(Line::styled(format!(" Help: {} ", tab.title()), BOLD))
@@ -647,13 +932,14 @@ mod tests {
         for tab in Tab::ALL {
             app.tab = tab;
             let text = screen(&mut app, 80, 24);
+            assert!(text.contains("[o]") && text.contains("[p]"), "{tab:?}");
             for k in keys::groups(tab)
                 .iter()
                 .chain([&GLOBAL])
                 .flat_map(|g| g.keys)
             {
                 assert!(
-                    text.contains(&format!("[{}]{}", k.key, k.label)),
+                    text.contains(&format!("[{}] {}", k.key, k.label)),
                     "{tab:?} {}",
                     k.label
                 );
@@ -673,6 +959,57 @@ mod tests {
             ] {
                 app.modal = modal;
                 screen(&mut app, w, h);
+            }
+        }
+    }
+
+    #[test]
+    fn header_stays_on_one_row() {
+        let mut app = App::new(mpsc::channel().0, Some("some-owner/some-repository".into()));
+        app.org = Some("some-owner".into());
+        for (width, texts) in [
+            (80, &["[1]", "[4]", "[o]", "[p]", "[f]", "[s]"][..]),
+            (
+                160,
+                &[
+                    "Pull Requests",
+                    "Repo:some-owner/some-repository",
+                    "State:Open",
+                ],
+            ),
+        ] {
+            let text = screen(&mut app, width, 24);
+            let first = text.lines().next().unwrap();
+            for t in texts {
+                assert!(first.contains(t), "{width}: {t} missing in {first}");
+            }
+        }
+    }
+
+    #[test]
+    fn reviewer_cell_has_exact_width() {
+        use crate::api::Reviewer;
+        for names in [
+            &[][..],
+            &["al"],
+            &["a-very-long-name"],
+            &["al", "bo", "a-very-long-name"],
+        ] {
+            let reviews = Reviews {
+                reviewers: names
+                    .iter()
+                    .map(|n| Reviewer {
+                        name: n.to_string(),
+                        state: "APPROVED".into(),
+                    })
+                    .collect(),
+                ..Reviews::default()
+            };
+            for width in [5, 10, 14, 30] {
+                let mut spans = Vec::new();
+                reviewer_cell(&mut spans, Some(&reviews), width);
+                let got: usize = spans.iter().map(Span::width).sum();
+                assert_eq!(got, width + 1, "{names:?}");
             }
         }
     }
