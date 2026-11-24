@@ -204,6 +204,7 @@ impl Form {
                     _ => {}
                 },
                 Kind::Choice(all, n) => match code {
+                    _ if all.is_empty() => {}
                     KeyCode::Right | KeyCode::Char(' ') => *n = (*n + 1) % all.len(),
                     KeyCode::Left => *n = (*n + all.len() - 1) % all.len(),
                     _ => {}
@@ -300,5 +301,38 @@ mod tests {
         form.key(KeyEvent::from(KeyCode::Tab));
         form.paste("a\r\nb");
         assert_eq!(form.text(1), "a\nb");
+    }
+
+    #[test]
+    fn random_editing_keeps_the_cursor_on_a_character() {
+        let keys = [
+            KeyCode::Char('a'),
+            KeyCode::Char('ệ'),
+            KeyCode::Char('日'),
+            KeyCode::Char('😀'),
+            KeyCode::Enter,
+            KeyCode::Backspace,
+            KeyCode::Delete,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Home,
+            KeyCode::End,
+        ];
+        let (mut buf, mut cur) = (String::new(), 0);
+        let mut seed = 7u32;
+        for _ in 0..50_000 {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let n = (seed >> 16) as usize;
+            let key = match n % 60 {
+                0 => KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+                1 => KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+                2 => KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+                _ => KeyEvent::from(keys[n % keys.len()]),
+            };
+            edit(&mut buf, &mut cur, !n.is_multiple_of(5), key);
+            assert!(buf.is_char_boundary(cur), "{buf:?} {cur}");
+        }
     }
 }

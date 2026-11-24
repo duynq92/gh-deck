@@ -224,11 +224,10 @@ impl Doc {
         for line in markdown::render(source) {
             // Entities such as `&#27;` may have brought control characters back.
             let safe = clean(&line.text);
-            let spans = if safe.len() == line.text.len() {
-                line.spans
-            } else {
-                Vec::new()
-            };
+            let mut spans = line.spans;
+            // Styling must never be able to cut a character in half.
+            spans.retain(|&(a, b, _)| *safe == *line.text && safe.get(a..b).is_some());
+            spans.sort_by_key(|s| s.0);
             let kind = kind.unwrap_or(match line.look {
                 Look::Text => Kind::Plain,
                 Look::Heading => Kind::Heading,
@@ -721,12 +720,14 @@ impl Doc {
 
 /// Old and new line number of a code line.
 fn numbers(kind: Kind, text: &str) -> (Option<u32>, Option<u32>) {
-    let number =
-        |range: std::ops::Range<usize>| text.get(range).and_then(|t| t.trim().parse().ok());
-    if kind.is_code() {
-        (number(0..5), number(6..11))
-    } else {
-        (None, None)
+    let columns = text.split('│').next().unwrap_or("");
+    let mut columns = columns.split_whitespace().map(|n| n.parse().ok());
+    let mut next = || columns.next().flatten();
+    match kind {
+        Kind::Add => (None, next()),
+        Kind::Del => (next(), None),
+        Kind::Context => (next(), next()),
+        _ => (None, None),
     }
 }
 
@@ -844,6 +845,11 @@ fn parse(diff: &str) -> Vec<File> {
                     (Kind::Del, write!(text, "{old:>5} {:>5} │-{code}", ""))
                 }
                 Some(b'\\') => (Kind::Context, write!(text, "{:>11} │{line}", "")),
+                // Not code, such as the note that a long diff was cut.
+                Some(first) if *first != b' ' => {
+                    file.lines.push((Kind::Hunk, line.to_string()));
+                    continue;
+                }
                 _ => (Kind::Context, write!(text, "{old:>5} {new:>5} │ {code}")),
             };
             debug_assert!(result.is_ok());
@@ -1151,5 +1157,121 @@ deleted file mode 100644
         assert_eq!(unquote(r#""b/vi\341\273\207t \"x\"""#), "b/việt \"x\"");
         let diff = "diff --git \"a/\\303\\251\" \"b/\\303\\251\"\nnew file mode 1\n--- /dev/null\n+++ \"b/\\303\\251\"\n@@ -0,0 +1 @@\n+x\n";
         assert_eq!(parse(diff)[0].path, "é");
+    }
+
+    /// Every combination of these pieces, at several widths and both modes.
+    #[test]
+    fn odd_markdown_never_panics() {
+        let pieces = [
+            "- ```\n  việt code\n  ```\n",
+            "-     indented\n",
+            "> - [x] ```x\n>   é\n>   ```\n",
+            "1. > quote **b•ld**\n",
+            "- [ ] ☐ `c•de` *i*\n  - ```\n    日本語\n    ```\n",
+            "| é | `•` |\n|---|---|\n| **日** | x |\n",
+            "# h **é** `•`\n",
+            "<details><summary>é &amp; •</summary>\n\n- a\n\n</details>\n",
+            "![é](u) [l•nk](x) ~~no~~ &#27;[31m&#x202e;\u{200b}\t\u{1f600}\n",
+            "```\n• unterminated\n",
+            "\n",
+        ];
+        let check = |source: &Source, raw: bool| {
+            for width in [2, 7, 30, 83] {
+                let mut doc = Doc::new(source, raw);
+                doc.layout(width);
+                for row in doc.visible(usize::MAX) {
+                    let _ = text(&row);
+                }
+            }
+        };
+        for a in pieces {
+            for b in pieces {
+                for c in pieces {
+                    let body = format!("{a}{b}{c}");
+                    let mut source = Source::preview(&format!("T\n\n{body}"));
+                    source.diff = Some(DIFF.into());
+                    source.threads = vec![thread("src/a b.rs", Some(3), "RIGHT", &body)];
+                    check(&source, false);
+                    check(&source, true);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn long_line_numbers_are_read_in_full() {
+        let diff =
+            "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -123456,2 +1234567,2 @@\n keep\n-old\n+new\n";
+        let source = Source {
+            diff: Some(diff.into()),
+            threads: vec![thread("f", Some(1_234_568), "RIGHT", "here")],
+            ..Source::default()
+        };
+        let mut doc = Doc::new(&source, false);
+        doc.layout(80);
+        doc.start_cursor(40);
+        let mut places = Vec::new();
+        for _ in 0..3 {
+            let place = doc.place().unwrap();
+            places.push((place.line, place.side));
+            doc.move_cursor(1, 40);
+        }
+        let want = [
+            (1_234_567, "RIGHT"),
+            (123_457, "LEFT"),
+            (1_234_568, "RIGHT"),
+        ];
+        assert_eq!(places, want.map(|(n, s)| (n, s.to_string())));
+        let rows = all(&doc);
+        let new = rows.iter().position(|r| r.contains("+new")).unwrap();
+        assert!(rows[new + 1].contains("unresolved"));
+    }
+
+    #[test]
+    fn a_cut_diff_ends_with_a_note() {
+        let diff =
+            "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,9 +1,9 @@\n a\n+b\n\u{2026} truncated";
+        let file = &parse(diff)[0];
+        assert_eq!(file.lines.last().unwrap().0, Kind::Hunk);
+        assert_eq!((file.added, file.deleted), (1, 0));
+    }
+
+    /// Diffs cut, shuffled and damaged at every place.
+    #[test]
+    fn damaged_diffs_never_panic() {
+        let mut texts: Vec<String> = DIFF
+            .char_indices()
+            .flat_map(|(i, _)| [DIFF[..i].to_string(), DIFF[i..].to_string()])
+            .collect();
+        for junk in [
+            "@@ -1 +1 @@\n",
+            "@@ -x,y +z @@\n",
+            "@@ -0,0 +4294967295,9 @@\n+é\n",
+            "+++ \"b/\\9\\\n",
+            "é\n",
+            "\\\n",
+        ] {
+            texts.push(format!("{junk}{DIFF}{junk}{DIFF}"));
+            texts.push(DIFF.replace('\n', &format!("\n{junk}")));
+        }
+        for text in texts {
+            let source = Source {
+                diff: Some(text),
+                threads: vec![thread("gone", Some(1), "LEFT", "x")],
+                ..Source::default()
+            };
+            for width in [2, 13, 60] {
+                let mut doc = Doc::new(&source, false);
+                doc.layout(width);
+                doc.start_cursor(9);
+                for by in [1, 5, -3, 99] {
+                    doc.move_cursor(by, 9);
+                    let _ = (doc.place(), doc.mark(), doc.current_file());
+                    doc.jump(by > 0, 9);
+                    doc.jump_thread(by > 0, 9);
+                    doc.anchor = doc.cursor;
+                }
+            }
+        }
     }
 }

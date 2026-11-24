@@ -301,6 +301,7 @@ impl Render {
                 None => prefix.push_str("  "),
             }
         }
+        let marker_end = prefix.len();
         if self.code {
             prefix.push_str("  ");
         }
@@ -310,7 +311,7 @@ impl Render {
             spans.push((0, quote, DIM));
         }
         if let Some(marker) = &marker {
-            spans.push((at - marker.len(), at, BOLD));
+            spans.push((marker_end - marker.len(), marker_end, BOLD));
         }
         spans.extend(self.spans.drain(..).map(|(a, b, s)| (a + at, b + at, s)));
         self.lines.push(Line {
@@ -330,7 +331,8 @@ impl Render {
         let widths: Vec<usize> = (0..columns)
             .map(|c| {
                 let cells = rows.iter().filter_map(|r| r.get(c));
-                cells.map(|t| t.trim().width()).max().unwrap_or(0)
+                // One huge cell must not pad every other row to its width.
+                cells.map(|t| t.trim().width()).max().unwrap_or(0).min(60)
             })
             .collect();
         for (n, row) in rows.iter().enumerate() {
@@ -341,7 +343,7 @@ impl Render {
                 }
                 self.styled(if n == 0 { BOLD } else { 0 }, cell);
                 if c + 1 < columns {
-                    self.push(&" ".repeat(width - cell.width()));
+                    self.push(&" ".repeat(width.saturating_sub(cell.width())));
                 }
             }
             self.flush();
@@ -494,11 +496,26 @@ mod tests {
     }
 
     #[test]
+    fn code_in_a_list_keeps_its_marker() {
+        let lines = render("- ```\n  x\n  ```");
+        assert_eq!(lines[0].text, "•   x");
+        assert_eq!(lines[0].spans, [(0, "• ".len(), BOLD)]);
+    }
+
+    #[test]
     fn survives_odd_input() {
         for source in [
             "", "<", "<img", "```", "- ", "|", "- [ ]", "> ", "<!--", "[", "**",
         ] {
             render(source);
         }
+    }
+
+    #[test]
+    fn a_huge_cell_does_not_blow_up_the_table() {
+        let mut source = format!("| {} | b |\n|---|---|\n", "x".repeat(20_000));
+        source.push_str(&"| a | b |\n".repeat(3_000));
+        let size: usize = render(&source).iter().map(|l| l.text.len()).sum();
+        assert!(size < 1_000_000, "{size}");
     }
 }
