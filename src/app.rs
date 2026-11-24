@@ -12,7 +12,7 @@ use std::thread;
 
 pub enum Msg {
     Input(std::io::Result<Event>),
-    Repos(Result<Repos>),
+    Repos(Result<(Repos, Option<String>)>),
     List {
         tab: Tab,
         job: u64,
@@ -157,12 +157,12 @@ impl App {
     }
 
     pub fn start(&mut self) {
-        self.load_repos();
+        self.load_repos(None);
         self.load(self.tab, false);
     }
 
-    fn load_repos(&mut self) {
-        self.spawn(|| Msg::Repos(api::repos()));
+    fn load_repos(&mut self, after: Option<String>) {
+        self.spawn(move || Msg::Repos(api::repos(after.as_deref())));
     }
 
     pub fn list(&self) -> &List {
@@ -304,18 +304,27 @@ impl App {
                 eprintln!("terminal input failed: {e}");
                 self.quit = true;
             }
-            Msg::Repos(Ok(repos)) => {
-                self.repos = Some(repos);
-                if self.scope.is_none() {
+            Msg::Repos(Ok((page, cursor))) => {
+                let first = self.repos.is_none();
+                let repos = self.repos.get_or_insert_default();
+                repos.login = page.login;
+                repos.orgs = page.orgs;
+                repos.names.extend(page.names);
+                let wanted = repos.names.len() < api::MAX_REPOS;
+                // Lists need only the first page, so they start right away.
+                if first && self.scope.is_none() {
                     for tab in Tab::ALL {
                         if self.lists[tab as usize].loading {
                             self.load(tab, false);
                         }
                     }
                 }
+                if cursor.is_some() && wanted {
+                    self.load_repos(cursor);
+                }
             }
             Msg::Repos(Err(e)) => {
-                if self.scope.is_none() {
+                if self.repos.is_none() && self.scope.is_none() {
                     for list in &mut self.lists {
                         list.loading = false;
                     }
@@ -569,10 +578,14 @@ impl App {
             }
             Act::Filter => {
                 let count = api::filters(self.tab).len();
-                let ticket = matches!(self.tab, Tab::Prs | Tab::Issues);
-                if count > 1 && (ticket || self.scope.is_none()) {
+                let (tab, scoped) = (self.tab, self.scope.is_some());
+                let ticket = matches!(tab, Tab::Prs | Tab::Issues);
+                if count > 1 && (ticket || !scoped) {
                     let list = self.list_mut();
                     list.filter = (list.filter + 1) % count;
+                    if scoped && api::filters(tab)[list.filter].1 == api::MINE {
+                        list.filter = (list.filter + 1) % count;
+                    }
                     self.reset();
                 }
             }
@@ -593,7 +606,7 @@ impl App {
             }
             Act::Refresh => {
                 if self.repos.is_none() {
-                    self.load_repos();
+                    self.load_repos(None);
                 }
                 self.load(self.tab, false);
                 if self.detail_focus {
