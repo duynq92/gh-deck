@@ -98,10 +98,10 @@ fn draw_body(frame: &mut Frame, app: &mut App, body: Rect) {
     if app.zoom && app.detail_focus {
         return draw_doc(frame, app, body);
     }
-    let split = if app.tab == Tab::Prs && body.width >= 120 {
+    let split = if app.tab == Tab::Prs && body.width >= 110 {
         // Reading the changes matters most.
         Layout::horizontal([Constraint::Ratio(1, 3), Constraint::Fill(1)])
-    } else if app.tab == Tab::Activity && body.width >= 120 {
+    } else if app.tab == Tab::Activity && body.width >= 110 {
         Layout::horizontal([Constraint::Percentage(42), Constraint::Fill(1)])
     } else if body.width >= 180 {
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
