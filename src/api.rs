@@ -1422,6 +1422,10 @@ pub fn submit(form: &Form) -> std::result::Result<Cmd, String> {
             need(0)?;
             return review::comment(&t.repo, t.number, &form.extra, text(0));
         }
+        (Act::AiPost, Some(Item::Ticket(t))) => {
+            let (text, mention) = (text(0), form.toggle(1));
+            return review::post(&t.repo, t.number, &form.extra, text, mention);
+        }
         (Act::Reply, Some(Item::Ticket(t))) => {
             need(0)?;
             return review::reply(&t.repo, t.number, &form.extra, text(0));

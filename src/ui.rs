@@ -685,6 +685,14 @@ fn doc_line<'a>(row: &Visible<'a>) -> (Line<'a>, Option<Color>) {
             fg(Color::Indexed(220)).add_modifier(Modifier::BOLD),
             Some(Color::Indexed(235)),
         ),
+        LineKind::Finding => (
+            fg(Color::Indexed(177)).add_modifier(Modifier::BOLD),
+            Some(Color::Indexed(235)),
+        ),
+        LineKind::Accepted => (
+            fg(Color::Indexed(114)).add_modifier(Modifier::BOLD),
+            Some(Color::Indexed(235)),
+        ),
         LineKind::Done => (fg(Color::Indexed(114)), Some(Color::Indexed(235))),
         LineKind::Note => (fg(Color::Indexed(252)), Some(Color::Indexed(235))),
         LineKind::Summary if indent == 0 => return (summary_line(text), None),
@@ -756,6 +764,7 @@ fn group_color(group: &Group) -> Color {
         "Manage" => Color::Magenta,
         "My PR" => Color::Yellow,
         "Teams" => Color::Cyan,
+        "AI" => Color::Indexed(177),
         _ => Color::Gray,
     }
 }
@@ -789,6 +798,13 @@ fn action(app: &App, name: &str, k: &Key, color: Color) -> [Span<'static>; 2] {
 fn footer_line(app: &App, width: usize) -> Line<'static> {
     if app.detail_focus && app.doc.cursor.is_some() {
         let keys: &[(&str, &str)] = match (app.doc.thread_at_cursor(), app.doc.anchor) {
+            _ if app.doc.finding_at_cursor().is_some() => &[
+                ("Space", "Accept"),
+                ("e", "Edit"),
+                ("d", "Discard"),
+                ("P", "Post accepted"),
+                ("u/U", "Next"),
+            ],
             (Some(_), _) => &[
                 ("Enter", "Reply"),
                 ("x", "Resolve/Reopen"),
@@ -885,7 +901,7 @@ fn status(app: &App) -> Option<(String, Style)> {
         (Some(Status::Error(e)), _) => (format!("✗ {e}"), Color::Red),
         (_, Some(busy)) => (format!("… {busy}"), Color::Yellow),
         (Some(Status::Info(i)), _) => (i.clone(), Color::Green),
-        _ => return None,
+        _ => (format!("… {}", app.ai_running.as_ref()?), Color::Yellow),
     };
     let text = clean(&text).replace('\n', " ");
     Some((text, Style::new().fg(color).add_modifier(Modifier::BOLD)))
@@ -963,6 +979,9 @@ fn draw_help(frame: &mut Frame, tab: Tab) {
         }
     }
     if tab == Tab::Prs {
+        lines.push(Line::raw(
+            " AI REVIEW  A start, Space accept, e edit, d discard, P post accepted",
+        ));
         lines.push(Line::raw(
             " LINE MODE  l start, Space range, Enter comment or reply, x resolve",
         ));
@@ -1416,6 +1435,7 @@ mod tests {
                 })
                 .collect(),
             show_resolved: n.is_multiple_of(2),
+            ai: None,
         };
         let mut seed = 11u32;
         let mut next = move |below: u32| {
@@ -1438,7 +1458,8 @@ mod tests {
             ))));
             app.handle(Msg::Teams(Ok(vec!["o/t".into(), "o/é".into()])));
             for step in 0..1_000 {
-                match next(40) {
+                match next(42) {
+                    40 => app.feed_ai(text, next(6) as usize),
                     0 => app.feed(Tab::Prs, next(2) == 0, Ok(page(next(30).into(), 0))),
                     1 => app.feed(Tab::Issues, false, Ok(page(next(9).into(), 0))),
                     2 => app.feed(Tab::Releases, false, Ok(page(next(9).into(), 1))),

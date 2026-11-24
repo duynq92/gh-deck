@@ -60,6 +60,17 @@ impl Form {
         let (verb, fields) = match (act, &item) {
             (Act::Comment, Some(_)) => ("Comment on", vec![field("Comment", area(""))]),
             (Act::LineComment, Some(_)) => ("Comment on", vec![field("Comment", area(""))]),
+            (Act::AiEdit, Some(_)) => (
+                "Finding on",
+                vec![field("Title", line("")), field("Comment", area(""))],
+            ),
+            (Act::AiPost, Some(_)) => (
+                "Post AI findings to",
+                vec![
+                    field("Summary (optional)", area("")),
+                    field("Mention the AI tool", Kind::Toggle(true)),
+                ],
+            ),
             (Act::Reply, Some(_)) => ("Reply in", vec![field("Reply", area(""))]),
             (Act::Approve, Some(_)) => ("Approve", vec![field("Comment (optional)", area(""))]),
             (Act::RequestChanges, Some(_)) => {

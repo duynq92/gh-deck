@@ -32,7 +32,7 @@ its letter, or move with the arrows and press `Enter`. `?` explains the current 
 | Where | Keys |
 |---|---|
 | Everywhere | `1`-`4`/`Tab` tabs, `j`/`k` move, `g`/`G` top/end, `Enter` open, `Esc` back, `o` organization, `p` repo, `f` filter, `s` state, `/` find, `>` more, `R` refresh, `z` zoom, `.` all actions, `?` help, `!` last message, `q` quit |
-| Pull requests | `i` info, `M` raw/rendered Markdown, `d` diff, `n`/`N` next/previous file, `h` checks, `w` web, `l` line comment, `u`/`U` next/previous discussion, `O` resolved discussions, `a` approve, `x` request changes, `c` comment, `v` reviewers, `r` ready (from draft), `e` title, `E` description and `T` checkboxes (your own PRs), `m` merge, `X` close/reopen, `b` checkout, `t` hide teams |
+| Pull requests | `i` info, `M` raw/rendered Markdown, `d` diff, `n`/`N` next/previous file, `h` checks, `w` web, `l` line comment, `u`/`U` next/previous discussion, `O` resolved discussions, `a` approve, `x` request changes, `c` comment, `A` AI review, `P` post findings, `v` reviewers, `r` ready (from draft), `e` title, `E` description and `T` checkboxes (your own PRs), `m` merge, `X` close/reopen, `b` checkout, `t` hide teams |
 | Issues | `i` info, `w` web, `n` new, `c` comment, `l` labels, `a` assignees, `X` close/reopen |
 | Releases | `i` info, `w` web, `D` download, `n` new, `e` edit, `P` publish, `X` delete |
 | Actions | `i` jobs, `l` log, `L` failed log, `w` web, `r` rerun all, `F` rerun failed, `x` cancel, `t` trigger workflow |
@@ -67,6 +67,31 @@ given on the command line is not.
 
 Titles and descriptions are loaded when you press the key. Saving is refused when
 they changed on GitHub meanwhile. Ticking checkboxes saves at once; unticking asks.
+
+## AI review
+
+`A` on an open pull request asks an AI tool for a first review. Findings appear under
+their line of code: `Space` accepts, `e` edits, `d` discards, `P` posts the accepted
+ones as one comment review. Nothing is posted otherwise, and it never approves.
+
+The tool runs on your machine with your login and **sends title, description and diff
+to its provider**. Claude Code runs without a shell, files, plugins or project
+instructions. Codex is not enabled yet: it cannot be kept from reading your files.
+Lock files, generated files and what exceeds 200 KB are left out and named.
+
+Settings in `~/.config/ghdeck/ai.json`, all optional:
+
+```json
+{
+  "tool": "claude",
+  "model": "sonnet",
+  "custom": ["my-reviewer", "--json"],
+  "blocked": ["secret-org", "org/private-repo"]
+}
+```
+
+A custom command gets the prompt on stdin and prints `{"findings": [{"path", "line",
+"side", "severity", "title", "body"}]}`. It is run without a shell; its safety is yours.
 
 ## Design
 

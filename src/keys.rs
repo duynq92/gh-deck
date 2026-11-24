@@ -52,6 +52,9 @@ pub enum Act {
     Refresh,
     Zoom,
     Raw,
+    Ai,
+    AiPost,
+    AiEdit,
     Lines,
     NextThread,
     PrevThread,
@@ -174,6 +177,13 @@ const PRS: &[Group] = &[
             k('a', "Approve", Act::Approve),
             k('x', "Request changes", Act::RequestChanges),
             k('c', "Comment", Act::Comment),
+        ],
+    },
+    Group {
+        name: "AI",
+        keys: &[
+            k('A', "AI review", Act::Ai),
+            k('P', "Post findings", Act::AiPost),
         ],
     },
     Group {
@@ -304,6 +314,8 @@ pub fn footer(tab: Tab, reading: bool) -> &'static [Act] {
             NextFile,
             Lines,
             NextThread,
+            AiPost,
+            Ai,
             Zoom,
             Approve,
             RequestChanges,

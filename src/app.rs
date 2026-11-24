@@ -1,5 +1,6 @@
 //! Application state and key handling.
 
+use crate::ai::{self, Review, Settings, Tool};
 use crate::api::Readiness;
 use crate::api::{self, Candidates, Choice, Item, Page, PrText, Query, Repos, Reviews};
 use crate::config;
@@ -10,6 +11,7 @@ use crate::keys::{self, Act, Tab};
 use crate::review;
 use crate::tasks;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
@@ -54,6 +56,13 @@ pub enum Msg {
         job: u64,
         item: Box<Item>,
         result: Result<Readiness>,
+    },
+    /// Tools, what they do with the code, and why they cannot be used.
+    AiTools(Vec<(Tool, String, Option<String>)>),
+    Ai {
+        job: u64,
+        item: String,
+        result: Result<Review>,
     },
     Done {
         tab: Tab,
@@ -111,6 +120,9 @@ pub enum Pick {
         number: u64,
         requested: Vec<String>,
     },
+    AiTool,
+    /// What to do when there are findings already.
+    AiAgain,
     /// Checkboxes of a description; values are offsets into `body`.
     Tasks {
         repo: String,
@@ -236,6 +248,13 @@ pub struct App {
     /// Where the view is saved; `None` until it was read without trouble.
     view_path: Option<PathBuf>,
     saved: config::View,
+    pub ai: Settings,
+    ai_path: Option<PathBuf>,
+    /// What the running AI review is about.
+    pub ai_running: Option<String>,
+    ai_job: u64,
+    /// Findings by item, only until the app ends.
+    reviews: HashMap<String, Review>,
     /// A repository was given on the command line: do not save it.
     fixed: bool,
     pub modal: Option<Modal>,
@@ -283,6 +302,11 @@ impl App {
             config: None,
             view_path: None,
             saved: config::View::default(),
+            ai: Settings::default(),
+            ai_path: None,
+            ai_running: None,
+            ai_job: 0,
+            reviews: HashMap::new(),
             fixed,
             modal: None,
             finding: false,
@@ -316,6 +340,15 @@ impl App {
                 self.config = Some(teams);
             }
             Err(e) => self.error(format!("{}: {e}", teams.display())),
+        }
+        if let Some(path) = config::path("ai.json") {
+            match config::load_ai(&path) {
+                Ok(settings) => {
+                    self.ai = settings;
+                    self.ai_path = Some(path);
+                }
+                Err(e) => self.error(format!("{}: {e}", path.display())),
+            }
         }
         match config::load_view(&view) {
             Ok(saved) => {
@@ -469,7 +502,17 @@ impl App {
         self.doc_id = id;
     }
 
-    fn show(&mut self, source: Source) {
+    /// Attach the findings of this item.
+    fn show(&mut self, mut source: Source) {
+        source.ai = match self.reviews.get(&self.doc_id) {
+            // Previews have no changes to put findings on.
+            Some(review) if source.diff.is_some() => {
+                let mut review = review.clone();
+                review.outdated = review.oid != source.oid;
+                Some(review)
+            }
+            _ => None,
+        };
         self.doc = Doc::new(&source, self.raw);
         self.source = source;
     }
@@ -613,6 +656,7 @@ impl App {
                         d.show_resolved = self.source.show_resolved;
                         // Line mode goes on: its keys mean something else outside.
                         let mark = self.doc.mark().map(|mark| match mark {
+                            Mark::Finding(n) => Mark::Finding(n),
                             Mark::Thread(n) => {
                                 let id = self.source.threads.get(n).map(|t| &t.id);
                                 let now = d.threads.iter().position(|t| Some(&t.id) == id);
@@ -702,7 +746,28 @@ impl App {
                     Err(e) => self.error(e),
                 }
             }
-            Msg::Merge { .. }
+            Msg::AiTools(tools) => {
+                if self.modal.is_none() {
+                    self.finding = false;
+                    let items = tools
+                        .into_iter()
+                        .map(|(tool, what, problem)| match problem {
+                            None => (format!("{}: {what}", tool.name()), tool.name().to_string()),
+                            Some(why) => (format!("{} ({why})", tool.name()), String::new()),
+                        });
+                    let items = items.collect();
+                    self.picker("Choose the AI tool".into(), items, 0, Pick::AiTool);
+                }
+            }
+            Msg::Ai { job, item, result } if job == self.ai_job => {
+                self.ai_running = None;
+                match result {
+                    Ok(review) => self.ai_done(item, review),
+                    Err(e) => self.error(e),
+                }
+            }
+            Msg::Ai { .. }
+            | Msg::Merge { .. }
             | Msg::Doc { .. }
             | Msg::Workflows { .. }
             | Msg::Reviewers { .. }
@@ -720,6 +785,13 @@ impl App {
                         let last = out.trim().lines().last().unwrap_or("").to_string();
                         self.info(format!("✓ {label} {last}"));
                         self.load(tab, false);
+                        // Posted findings are discussions now.
+                        if let Some(form) = form.filter(|f| f.act == Act::AiPost)
+                            && let Some(item) = &form.item
+                            && let Some(review) = self.reviews.get_mut(&item.id())
+                        {
+                            review.findings.retain(|f| !f.accepted);
+                        }
                         if reload && self.detail_focus && tab == self.tab {
                             self.refresh_doc();
                         }
@@ -956,6 +1028,8 @@ impl App {
             Act::Quit => self.quit = true,
             Act::Help => self.modal = Some(Modal::Help),
             Act::Raw => self.toggle_raw(),
+            Act::Ai => self.ai_key(),
+            Act::AiPost => self.ai_post(),
             Act::Lines => self.start_lines(),
             Act::NextThread => self.jump_thread(true),
             Act::PrevThread => self.jump_thread(false),
@@ -1222,6 +1296,11 @@ impl App {
 
     fn toggle_resolved(&mut self) {
         self.source.show_resolved = !self.source.show_resolved;
+        self.rebuild();
+    }
+
+    /// Draw the document again, at the same place.
+    fn rebuild(&mut self) {
         let (mark, top) = (self.doc.mark(), self.doc.top);
         let (width, height) = (self.doc.width(), self.doc_height);
         self.doc = Doc::new(&self.source, self.raw);
@@ -1253,6 +1332,21 @@ impl App {
             KeyCode::Char('z') => self.zoom = !self.zoom,
             KeyCode::Char('?') => self.modal = Some(Modal::Help),
             KeyCode::Char('!') => self.act(Act::Message),
+            KeyCode::Char('A') => self.ai_key(),
+            KeyCode::Char('P') => self.ai_post(),
+            KeyCode::Char(c @ (' ' | 'e' | 'd')) if self.doc.finding_at_cursor().is_some() => {
+                if let Some(n) = self.doc.finding_at_cursor() {
+                    match c {
+                        'e' => self.ai_edit(n),
+                        _ => self.ai_decide(n, c == 'd'),
+                    }
+                }
+            }
+            KeyCode::Enter if self.doc.finding_at_cursor().is_some() => {
+                if let Some(n) = self.doc.finding_at_cursor() {
+                    self.ai_edit(n);
+                }
+            }
             KeyCode::Char(' ') | KeyCode::Char('v') => {
                 self.doc.anchor = match self.doc.anchor {
                     Some(_) => None,
@@ -1278,6 +1372,214 @@ impl App {
             self.modal = Some(Modal::Confirm(review::toggle(thread)));
         } else {
             self.error("GitHub does not let you resolve this discussion");
+        }
+    }
+
+    fn ai_key(&mut self) {
+        if self.ai_running.take().is_some() {
+            self.ai_job += 1; // ignore its answer
+            if !cfg!(test) {
+                ai::stop(); // would stop the programs of other tests
+            }
+            return self.info("AI review stopped");
+        }
+        let Some(Item::Ticket(t)) = self.list().selected() else {
+            return;
+        };
+        let repo = t.repo.clone();
+        if self.source.diff.is_none() || self.source.oid.is_empty() {
+            if !self.doc_loading {
+                self.open_doc(Act::Info);
+            }
+            return self.info("press A again when the changes are loaded");
+        }
+        if self.ai.blocks(&repo) {
+            return self.error(format!("{repo} is blocked in ai.json"));
+        }
+        let known = self
+            .source
+            .ai
+            .as_ref()
+            .is_some_and(|r| !r.findings.is_empty());
+        let height = self.doc_height;
+        if known && self.doc.finding_at_cursor().is_none() && self.doc.go_to_finding(None, height) {
+            self.detail_focus = true;
+            return;
+        }
+        if known {
+            let items = vec![
+                ("Run again".to_string(), "run".to_string()),
+                ("Choose another tool".to_string(), "tool".to_string()),
+            ];
+            return self.picker("AI review".into(), items, 0, Pick::AiAgain);
+        }
+        self.ai_start();
+    }
+
+    fn ai_start(&mut self) {
+        match self.ai.tool {
+            Some(tool) => self.ai_run(tool),
+            None => self.ai_choose(),
+        }
+    }
+
+    fn ai_choose(&mut self) {
+        let settings = self.ai.clone();
+        self.info("looking for AI tools");
+        self.spawn(move || Msg::AiTools(ai::tools(&settings)));
+    }
+
+    fn ai_run(&mut self, tool: Tool) {
+        let Some(Item::Ticket(t)) = self.list().selected().cloned() else {
+            return;
+        };
+        let Some(diff) = &self.source.diff else {
+            return self.error("the changes are not loaded");
+        };
+        // Choosing a tool takes a while; the selection may have moved on.
+        let item = Item::Ticket(t.clone()).id();
+        if self.ai.blocks(&t.repo) || item != self.doc_id {
+            return self.error(format!("not started: {item} is blocked or not open"));
+        }
+        let files = crate::doc::changed(diff);
+        let (prompt, left_out) = match ai::prompt(&t.title, &t.body, &files) {
+            Ok(prompt) => prompt,
+            Err(e) => return self.error(e),
+        };
+        self.ai_job += 1;
+        self.ai_running = Some(format!(
+            "AI review of {item}: {}, {} KB, [A] stops",
+            tool.name(),
+            prompt.len().div_ceil(1024)
+        ));
+        let (job, settings, oid) = (self.ai_job, self.ai.clone(), self.source.oid.clone());
+        self.spawn(move || Msg::Ai {
+            job,
+            item,
+            result: ai::review(tool, &settings, &prompt)
+                .and_then(|answer| ai::parse(&answer, &files))
+                .map(|findings| Review {
+                    oid,
+                    tool: tool.name().into(),
+                    findings,
+                    left_out,
+                    outdated: false,
+                }),
+        });
+    }
+
+    fn ai_done(&mut self, item: String, review: Review) {
+        let count = review.findings.len();
+        let left = review.left_out.len();
+        let here = item == self.doc_id && self.source.diff.is_some();
+        let mut text = match count {
+            0 => format!("AI review of {item}: no findings"),
+            n => format!("AI review of {item}: {n} findings, [A] shows them"),
+        };
+        if left > 0 {
+            text += &format!(" ({left} files not reviewed)");
+        }
+        self.info(text);
+        self.reviews.insert(item, review);
+        if here {
+            self.ai_refresh();
+        }
+    }
+
+    /// Show the current findings of the open document.
+    fn ai_refresh(&mut self) {
+        let outdated = |r: &Review| r.oid != self.source.oid;
+        let review = self.reviews.get(&self.doc_id).map(|r| Review {
+            outdated: outdated(r),
+            ..r.clone()
+        });
+        self.source.ai = review;
+        self.rebuild();
+    }
+
+    /// Accept, un-accept or discard the finding under the cursor.
+    fn ai_decide(&mut self, n: usize, discard: bool) {
+        let Some(review) = self.reviews.get_mut(&self.doc_id) else {
+            return;
+        };
+        let Some(finding) = review.findings.get_mut(n) else {
+            return;
+        };
+        if discard {
+            review.findings.remove(n);
+            let left = review.findings.len();
+            self.doc.cursor = None;
+            self.ai_refresh();
+            let height = self.doc_height;
+            if left > 0 {
+                self.doc.go_to_finding(Some(n.min(left - 1)), height);
+            }
+        } else {
+            finding.accepted = !finding.accepted;
+            self.ai_refresh();
+        }
+    }
+
+    fn ai_edit(&mut self, n: usize) {
+        let Some(item) = self.list().selected().cloned() else {
+            return;
+        };
+        let finding = self
+            .reviews
+            .get(&self.doc_id)
+            .and_then(|r| r.findings.get(n));
+        let Some(finding) = finding.cloned() else {
+            return;
+        };
+        let repo = item.repo().to_string();
+        if let Some(mut form) = Form::new(Tab::Prs, Act::AiEdit, &repo, Some(item), &n.to_string())
+        {
+            form.title = format!("Finding on {}", finding.path);
+            for (field, text, multi) in [(0, &finding.title, false), (1, &finding.body, true)] {
+                if let Some(f) = form.fields.get_mut(field) {
+                    f.kind = form::Kind::text(text, multi);
+                }
+            }
+            form.focus = 1;
+            self.modal = Some(Modal::Form(Box::new(form)));
+        }
+    }
+
+    fn ai_edited(&mut self, form: &Form) -> std::result::Result<(), String> {
+        let (title, body) = (form.text(0).trim(), form.text(1).trim());
+        if title.is_empty() {
+            return Err("Title is required".into());
+        }
+        let review = self.reviews.get_mut(&self.doc_id);
+        let n: Option<usize> = form.extra.parse().ok();
+        let finding = review.zip(n).and_then(|(r, n)| r.findings.get_mut(n));
+        let finding = finding.ok_or("the finding is gone")?;
+        finding.title = title.to_string();
+        finding.body = body.to_string();
+        finding.accepted = true;
+        self.ai_refresh();
+        Ok(())
+    }
+
+    fn ai_post(&mut self) {
+        let Some(item) = self.list().selected().cloned() else {
+            return;
+        };
+        let Some(review) = self.source.ai.as_ref().filter(|r| r.accepted() > 0) else {
+            return self.error("accept findings first: A, then Space");
+        };
+        if review.outdated {
+            return self.error("the pull request has newer commits; press A to run again");
+        }
+        let batch = review::Batch::new(review);
+        let extra = match serde_json::to_string(&batch) {
+            Ok(extra) => extra,
+            Err(e) => return self.error(e),
+        };
+        let repo = item.repo().to_string();
+        if let Some(mut form) = Form::new(Tab::Prs, Act::AiPost, &repo, Some(item), &extra) {
+            form.notes = batch.notes();
+            self.modal = Some(Modal::Form(Box::new(form)));
         }
     }
 
@@ -1579,6 +1881,7 @@ impl App {
             Act::NextThread | Act::PrevThread => self.doc.has_threads(),
             Act::Resolved => self.source.threads.iter().any(|t| t.resolved),
             Act::Lines => self.doc.has_files(),
+            Act::AiPost => self.source.ai.as_ref().is_some_and(|r| r.accepted() > 0),
             Act::Reviewers => mine && matches!(state, "open" | "draft"),
             Act::Title | Act::Description | Act::Tasks => mine,
             Act::Ready => mine && state == "draft",
@@ -1613,7 +1916,13 @@ impl App {
                 if key.code == KeyCode::Esc {
                     return;
                 }
-                if ctrl && key.code == KeyCode::Char('s') {
+                if ctrl && key.code == KeyCode::Char('s') && form.act == Act::AiEdit {
+                    // Stays here; nothing is sent.
+                    match self.ai_edited(&form) {
+                        Ok(()) => return,
+                        Err(e) => form.error = Some(e),
+                    }
+                } else if ctrl && key.code == KeyCode::Char('s') {
                     match api::submit(&form) {
                         Ok(cmd) => return self.execute(cmd, Some(form)),
                         Err(e) => form.error = Some(e),
@@ -1735,7 +2044,7 @@ impl App {
                     self.execute(cmd, None);
                 }
             }
-            Pick::Target(_) | Pick::Workflow(_) => {}
+            Pick::Target(_) | Pick::Workflow(_) | Pick::AiTool | Pick::AiAgain => {}
         }
     }
 
@@ -1748,6 +2057,24 @@ impl App {
             | Pick::Exclude
             | Pick::Reviewers { .. }
             | Pick::Tasks { .. } => {}
+            Pick::AiAgain => match value.as_str() {
+                "run" => self.ai_start(),
+                _ => self.ai_choose(),
+            },
+            Pick::AiTool => {
+                let tool = Tool::ALL.into_iter().find(|t| t.name() == value);
+                let Some(tool) = tool else {
+                    return self.error("this tool cannot be used");
+                };
+                self.ai.tool = Some(tool);
+                if let Some(path) = &self.ai_path
+                    && let Err(e) = config::save_ai(path, &self.ai)
+                {
+                    let text = format!("{}: {e}", path.display());
+                    self.error(text);
+                }
+                self.ai_run(tool);
+            }
             Pick::Target(act) => self.target(act, value),
             Pick::Workflow(repo) => {
                 if let Some(form) = Form::new(self.tab, Act::Trigger, &repo, None, &value) {
@@ -1790,6 +2117,30 @@ impl App {
     pub fn feed(&mut self, tab: Tab, append: bool, result: Result<Page>) {
         let job = self.lists[tab as usize].job;
         self.listed(tab, job, append, result);
+    }
+
+    pub fn feed_ai(&mut self, text: &str, count: usize) {
+        let (job, oid) = (self.ai_job, self.source.oid.clone());
+        let item = self.doc_id.clone();
+        let findings = (0..count).map(|n| ai::Finding {
+            path: ["f", "other"][n % 2].into(),
+            line: (n != 1).then_some(n as u32 + 1),
+            side: ["RIGHT", "LEFT"][n / 2 % 2].into(),
+            severity: "nit".into(),
+            title: text.into(),
+            body: text.into(),
+            accepted: n == 0,
+        });
+        self.handle(Msg::Ai {
+            job,
+            item,
+            result: Ok(Review {
+                oid,
+                findings: findings.collect(),
+                left_out: vec![text.into(); count],
+                ..Review::default()
+            }),
+        });
     }
 
     pub fn feed_doc(&mut self, refresh: bool, result: Result<Source>) {
@@ -2347,5 +2698,153 @@ mod tests {
         let before = app.doc.mark();
         again(&mut app);
         assert_eq!(app.doc.mark(), before);
+    }
+
+    fn finding(title: &str, line: Option<u32>) -> ai::Finding {
+        ai::Finding {
+            path: "f".into(),
+            line,
+            side: "RIGHT".into(),
+            severity: "major".into(),
+            title: title.into(),
+            body: "b".into(),
+            accepted: false,
+        }
+    }
+
+    fn with_findings() -> App {
+        let mut app = reviewing();
+        app.ai_job = 5;
+        app.ai_running = Some("x".into());
+        app.handle(Msg::Ai {
+            job: 5,
+            item: "o/r#1".into(),
+            result: Ok(Review {
+                oid: "abc".into(),
+                tool: "X".into(),
+                findings: vec![
+                    finding("one", Some(1)),
+                    finding("two", Some(2)),
+                    finding("three", None),
+                ],
+                ..Review::default()
+            }),
+        });
+        app
+    }
+
+    #[test]
+    fn findings_are_accepted_edited_discarded_and_posted() {
+        let mut app = with_findings();
+        assert!(app.ai_running.is_none());
+        press(&mut app, KeyCode::Char('P'));
+        assert!(app.modal.is_none(), "nothing is accepted yet");
+        press(&mut app, KeyCode::Char('A'));
+        let at = app.doc.finding_at_cursor().unwrap();
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.reviews["o/r#1"].findings[at].accepted);
+        assert_eq!(app.doc.finding_at_cursor(), Some(at), "the cursor stays");
+        press(&mut app, KeyCode::Char('u'));
+        while app.doc.finding_at_cursor().is_none() {
+            press(&mut app, KeyCode::Char('u'));
+        }
+        let next = app.doc.finding_at_cursor().unwrap();
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Char('!'));
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(
+            app.modal.is_none() && app.busy.is_none(),
+            "editing sends nothing"
+        );
+        assert_eq!(app.reviews["o/r#1"].findings[next].body, "b!");
+        assert_eq!(app.reviews["o/r#1"].accepted(), 2);
+        press(&mut app, KeyCode::Char('u'));
+        while app
+            .doc
+            .finding_at_cursor()
+            .is_none_or(|n| n == at || n == next)
+        {
+            press(&mut app, KeyCode::Char('u'));
+        }
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.reviews["o/r#1"].findings.len(), 2);
+        press(&mut app, KeyCode::Char('P'));
+        assert!(matches!(&app.modal, Some(Modal::Form(f)) if f.act == Act::AiPost));
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(app.busy.is_some());
+        let Some(Modal::Form(_)) = app.modal else {
+            let form = Form::new(
+                Tab::Prs,
+                Act::AiPost,
+                "o/r",
+                app.list().selected().cloned(),
+                "",
+            );
+            app.handle(Msg::Done {
+                tab: Tab::Prs,
+                reload: true,
+                label: "x".into(),
+                form: form.map(Box::new),
+                result: Ok(String::new()),
+            });
+            assert!(
+                app.reviews["o/r#1"].findings.is_empty(),
+                "posted ones are gone"
+            );
+            return;
+        };
+        panic!("the form is still open");
+    }
+
+    #[test]
+    fn outdated_findings_are_not_posted() {
+        let mut app = with_findings();
+        app.reviews.get_mut("o/r#1").unwrap().findings[0].accepted = true;
+        let mut newer = Source {
+            diff: app.source.diff.clone(),
+            oid: "newer".into(),
+            ..Source::default()
+        };
+        app.show(std::mem::take(&mut newer));
+        app.doc.layout(80);
+        assert!(app.source.ai.as_ref().unwrap().outdated);
+        press(&mut app, KeyCode::Char('P'));
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn ai_respects_blocking_and_can_be_stopped() {
+        let mut app = reviewing();
+        app.ai.tool = Some(Tool::Claude);
+        app.ai.blocked = vec!["o".into()];
+        press(&mut app, KeyCode::Char('A'));
+        assert!(app.ai_running.is_none());
+        app.ai.blocked.clear();
+        press(&mut app, KeyCode::Char('A'));
+        assert!(app.ai_running.is_some());
+        let job = app.ai_job;
+        press(&mut app, KeyCode::Char('A'));
+        assert!(app.ai_running.is_none());
+        app.handle(Msg::Ai {
+            job,
+            item: "o/r#1".into(),
+            result: Ok(Review::default()),
+        });
+        assert!(app.reviews.is_empty(), "a late answer is ignored");
+    }
+
+    #[test]
+    fn unusable_tools_cannot_be_chosen() {
+        let mut app = reviewing();
+        app.handle(Msg::AiTools(vec![
+            (Tool::Claude, "sends".into(), Some("not installed".into())),
+            (Tool::Custom, "gets".into(), None),
+        ]));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.ai.tool.is_none() && app.ai_running.is_none());
+        app.handle(Msg::AiTools(vec![(Tool::Custom, "gets".into(), None)]));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.ai.tool, Some(Tool::Custom));
+        assert!(app.ai_running.is_some());
     }
 }

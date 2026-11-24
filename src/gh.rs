@@ -145,7 +145,7 @@ pub fn run(args: &[String], stdin: Option<&str>, keep: Keep) -> Result<String> {
     }
 }
 
-fn collect(from: &mut impl Read, keep: Keep) -> io::Result<(Vec<u8>, bool)> {
+pub fn collect(from: &mut impl Read, keep: Keep) -> io::Result<(Vec<u8>, bool)> {
     let mut kept = Vec::new();
     match keep {
         Keep::All(n) | Keep::Head(n) => {

@@ -1,3 +1,4 @@
+mod ai;
 mod api;
 mod app;
 mod config;
@@ -73,7 +74,9 @@ fn run(terminal: &mut ratatui::DefaultTerminal, scope: Option<String>) -> io::Re
         })?;
     let mut app = App::new(tx, scope);
     app.start();
-    event_loop(terminal, &mut app, &rx)
+    let result = event_loop(terminal, &mut app, &rx);
+    ai::stop();
+    result
 }
 
 /// Blocks until something happens: no timers, so an idle app uses no CPU.
