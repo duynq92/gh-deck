@@ -31,7 +31,7 @@ Press `?` in the app for the current tab's shortcuts.
 | Where | Keys |
 |---|---|
 | Everywhere | `1`-`4`/`Tab` tabs, `j`/`k` move, `g`/`G` top/end, `Enter` open, `Esc` back, `o` organization, `p` repo, `f` filter, `s` state, `/` find, `>` more, `R` refresh, `?` help, `q` quit |
-| Pull requests | `i` info, `d` diff, `n`/`N` next/previous file, `h` checks, `w` web, `a` approve, `x` request changes, `c` comment, `m` merge, `X` close/reopen, `b` checkout |
+| Pull requests | `i` info, `d` diff, `n`/`N` next/previous file, `h` checks, `w` web, `a` approve, `x` request changes, `c` comment, `v` reviewers (your own PRs), `m` merge, `X` close/reopen, `b` checkout |
 | Issues | `i` info, `w` web, `n` new, `c` comment, `l` labels, `a` assignees, `X` close/reopen |
 | Releases | `i` info, `w` web, `D` download, `n` new, `e` edit, `P` publish, `X` delete |
 | Actions | `i` jobs, `l` log, `L` failed log, `w` web, `r` rerun all, `F` rerun failed, `x` cancel, `t` trigger workflow |
@@ -46,7 +46,7 @@ clears, `Enter` applies. Choices
 in one selector are alternatives; the selectors narrow each other. Without marks,
 `Enter` chooses just the highlighted row.
 
-Close, delete, publish, rerun and cancel ask for `y` first. Merge and review
+Close, delete, publish, rerun, cancel and reviewer changes ask for `y` first. Merge and review
 actions open a form that is only sent with `Ctrl+S`.
 
 ## Design

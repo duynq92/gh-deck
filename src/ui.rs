@@ -9,7 +9,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const ACCENT: Color = Color::Cyan;
@@ -702,6 +702,12 @@ fn key_spans(app: &App, group: &Group) -> Vec<Span<'static>> {
             k.act,
             Act::Merge | Act::Toggle | Act::Delete | Act::Cancel | Act::Publish
         );
+        let off =
+            k.act == Act::Reviewers && app.list().selected().is_some_and(|item| !app.is_mine(item));
+        if off {
+            spans.push(Span::styled(format!("[{}] {label} ", k.key), DIM));
+            continue;
+        }
         let style = if risky { KEY.fg(Color::Red) } else { KEY };
         spans.push(Span::styled(format!("[{}]", k.key), style));
         spans.push(Span::raw(format!(" {label} ")));
@@ -734,14 +740,18 @@ fn draw_confirm(frame: &mut Frame, label: &str) {
     let block = pane(true)
         .title(Line::styled(" Confirm ", BOLD))
         .title_bottom(hints(&[("y", "Yes"), ("n/Esc", "No")]));
-    let text = format!("{label}?");
-    let width = (text.width() as u16 + 6).max(40);
-    let inner = popup(frame, width, 5, block);
-    let line = fit(&text, (inner.width as usize).min(text.width()));
-    frame.render_widget(
-        Paragraph::new(vec![Line::raw(""), Line::raw(line)]).centered(),
-        inner,
-    );
+    let text = format!("{}?", clean(label));
+    let width = (text.width() as u16 + 6).clamp(40, 76);
+    // Word wrapping may need a little more than the exact number of rows.
+    let rows = text.width() as u16 / (width - 8) + 1;
+    let inner = popup(frame, width, rows + 4, block);
+    let inner = Rect {
+        y: inner.y + 1.min(inner.height),
+        height: inner.height.saturating_sub(1),
+        ..inner
+    };
+    let text = Paragraph::new(text).wrap(Wrap { trim: true }).centered();
+    frame.render_widget(text, inner);
 }
 
 fn draw_help(frame: &mut Frame, tab: Tab) {
