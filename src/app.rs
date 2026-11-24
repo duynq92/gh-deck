@@ -1,6 +1,6 @@
 //! Application state and key handling.
 
-use crate::api::{self, Detail, Item, Page, Query, Repos, Reviews};
+use crate::api::{self, Choice, Detail, Item, Page, Query, Repos, Reviews};
 use crate::doc::Doc;
 use crate::form::{self, Form};
 use crate::gh::{self, Cmd, GhError, Result};
@@ -50,9 +50,8 @@ pub struct List {
     pub cursor: Option<String>,
     pub loading: bool,
     pub loaded: bool,
-    /// Name and value of the chosen filter; `None` is everything.
-    pub filter: Option<(String, String)>,
-    pub state: usize,
+    pub filters: Vec<Choice>,
+    pub states: Vec<Choice>,
     pub find: String,
     job: u64,
 }
@@ -76,21 +75,72 @@ pub enum Pick {
     Org,
     Scope,
     Filter,
+    State,
     Target(Act),
     Workflow(String),
 }
 
 pub struct Picker {
     pub title: String,
-    /// (label, value)
-    pub items: Vec<(String, String)>,
+    pub items: Vec<Choice>,
+    /// Marked values; only used when several can be chosen.
+    pub marked: Vec<String>,
     pub find: String,
     pub sel: usize,
     pub pick: Pick,
+    touched: bool,
+    moved: bool,
 }
 
 impl Picker {
-    pub fn view(&self) -> Vec<&(String, String)> {
+    pub fn multi(&self) -> bool {
+        matches!(
+            self.pick,
+            Pick::Org | Pick::Scope | Pick::Filter | Pick::State
+        )
+    }
+
+    /// Whether the row's box is checked; "All" means nothing else is.
+    pub fn is_marked(&self, value: &str) -> bool {
+        if value.is_empty() {
+            self.marked.is_empty()
+        } else {
+            self.marked.iter().any(|m| m == value)
+        }
+    }
+
+    fn toggle(&mut self) {
+        let Some(value) = self.view().get(self.sel).map(|i| i.1.clone()) else {
+            return;
+        };
+        self.touched = true;
+        if value.is_empty() {
+            self.marked.clear();
+        } else if self.is_marked(&value) {
+            self.marked.retain(|m| m != &value);
+        } else {
+            self.marked.push(value);
+        }
+    }
+
+    /// The choices to apply, or `None` when nothing was changed. Without any
+    /// mark toggled, the highlighted row alone is chosen.
+    fn chosen(&self) -> Option<Vec<Choice>> {
+        let marked: Vec<String> = match (self.touched, self.moved) {
+            (true, _) => self.marked.clone(),
+            (false, true) => vec![self.view().get(self.sel)?.1.clone()],
+            (false, false) => return None,
+        };
+        Some(
+            self.items
+                .iter()
+                .filter(|i| !i.1.is_empty() && marked.contains(&i.1))
+                .cloned()
+                .collect(),
+        )
+    }
+
+    pub fn view(&self) -> Vec<&Choice> {
         let needle = self.find.to_lowercase();
         self.items
             .iter()
@@ -115,10 +165,10 @@ pub struct App {
     tx: Sender<Msg>,
     pub tab: Tab,
     pub lists: [List; 4],
-    /// Chosen organization (or the user).
-    pub org: Option<String>,
-    /// Chosen repository.
-    pub scope: Option<String>,
+    /// Chosen organizations (or the user).
+    pub orgs: Vec<Choice>,
+    /// Chosen repositories.
+    pub scope: Vec<Choice>,
     pub repos: Option<Repos>,
     pub modal: Option<Modal>,
     pub finding: bool,
@@ -143,9 +193,12 @@ impl App {
         App {
             tx,
             tab: Tab::Prs,
-            lists: Default::default(),
-            org: None,
-            scope,
+            lists: Tab::ALL.map(|tab| List {
+                states: api::default_states(tab),
+                ..List::default()
+            }),
+            orgs: Vec::new(),
+            scope: scope.into_iter().map(|s| (s.clone(), s)).collect(),
             repos: None,
             modal: None,
             finding: false,
@@ -201,26 +254,26 @@ impl App {
     }
 
     fn load(&mut self, tab: Tab, append: bool) {
-        let (org, scope) = (self.org.clone(), self.scope.clone());
-        let repos = match (&self.repos, &scope) {
-            (Some(r), _) => r.clone(),
-            (None, Some(_)) => Repos::default(),
-            (None, None) => {
+        let repos = match &self.repos {
+            Some(r) => r.clone(),
+            None if !self.scope.is_empty() => Repos::default(),
+            None => {
                 // Continues when the repository list arrives.
                 self.lists[tab as usize].loading = true;
                 return;
             }
         };
+        let (orgs, scope) = (self.orgs.clone(), self.scope.clone());
         let list = &mut self.lists[tab as usize];
         list.job += 1;
         list.loading = true;
         let job = list.job;
         let query = Query {
             tab,
-            org,
-            scope,
-            filter: list.filter.clone().unwrap_or_default().1,
-            state: list.state,
+            orgs,
+            repos: scope,
+            filters: list.filters.clone(),
+            states: list.states.clone(),
             cursor: list.cursor.clone().filter(|_| append),
         };
         self.spawn(move || Msg::List {
@@ -320,7 +373,7 @@ impl App {
                 repos.names.extend(page.names);
                 let wanted = repos.names.len() < api::MAX_REPOS;
                 // Lists need only the first page, so they start right away.
-                if first && self.scope.is_none() {
+                if first && self.scope.is_empty() {
                     for tab in Tab::ALL {
                         if self.lists[tab as usize].loading {
                             self.load(tab, false);
@@ -345,7 +398,7 @@ impl App {
             Msg::Reviews(Ok(reviews)) => self.reviewed(reviews),
             Msg::Reviews(Err(e)) => self.error(format!("cannot load reviews: {e}")),
             Msg::Repos(Err(e)) => {
-                if self.repos.is_none() && self.scope.is_none() {
+                if self.repos.is_none() && self.scope.is_empty() {
                     for list in &mut self.lists {
                         list.loading = false;
                     }
@@ -509,6 +562,7 @@ impl App {
                 Some(Modal::Picker(p)) => {
                     p.find.extend(text.chars().filter(|c| !c.is_control()));
                     p.sel = 0;
+                    p.moved = true;
                 }
                 None if self.finding => {
                     let list = self.list_mut();
@@ -633,7 +687,7 @@ impl App {
         match act {
             Act::Quit => self.quit = true,
             Act::Help => self.modal = Some(Modal::Help),
-            Act::Repo => self.pick_repo("Show repository", Pick::Scope),
+            Act::Repo => self.pick_scope(),
             Act::Find => {
                 self.detail_focus = false;
                 self.finding = true;
@@ -642,14 +696,8 @@ impl App {
             Act::Filter => {
                 let teams = self.repos.as_ref().map_or(&[][..], |r| &r.teams);
                 let items = api::filters(self.tab, teams);
-                let current = self.list().filter.as_ref();
-                let sel = items
-                    .iter()
-                    .position(|i| Some(i) == current)
-                    .unwrap_or_default();
-                if !items.is_empty() {
-                    self.picker("Filter".into(), items, sel, Pick::Filter);
-                }
+                let marked = self.list().filters.clone();
+                self.multi_picker("Filter", items, &marked, Pick::Filter);
             }
             Act::NextFile | Act::PrevFile => {
                 if self.doc.has_files() {
@@ -661,12 +709,9 @@ impl App {
                 }
             }
             Act::State => {
-                let count = api::states(self.tab).len();
-                if count > 1 {
-                    let list = self.list_mut();
-                    list.state = (list.state + 1) % count;
-                    self.reset();
-                }
+                let items = api::states(self.tab);
+                let marked = self.list().states.clone();
+                self.multi_picker("State", items, &marked, Pick::State);
             }
             Act::More => {
                 if self.list().cursor.is_some() && !self.list().loading {
@@ -685,9 +730,9 @@ impl App {
                 }
             }
             Act::Info | Act::Diff | Act::Checks | Act::Log | Act::FailedLog => self.open_doc(act),
-            Act::New | Act::Trigger => match self.scope.clone() {
-                Some(repo) => self.target(act, repo),
-                None => self.pick_repo("Choose repository", Pick::Target(act)),
+            Act::New | Act::Trigger => match self.scope.as_slice() {
+                [(_, repo)] => self.target(act, repo.clone()),
+                _ => self.pick_target(act),
             },
             _ => {
                 if let Some(item) = self.list().selected().cloned() {
@@ -754,28 +799,55 @@ impl App {
         }
     }
 
-    fn pick_repo(&mut self, title: &str, pick: Pick) {
-        let Some(repos) = &self.repos else {
-            self.error("the repository list is not loaded yet; press R to retry");
-            return;
-        };
-        let mut items: Vec<(String, String)> = Vec::with_capacity(repos.names.len() + 1);
-        if pick == Pick::Scope {
-            items.push(("All".into(), String::new()));
-        } else if let Some(item) = self.list().selected() {
+    /// Choose the repository an action applies to.
+    fn pick_target(&mut self, act: Act) {
+        let mut items: Vec<Choice> = Vec::new();
+        if let Some(item) = self.list().selected() {
             // The selected item's repository is the likely target.
             items.push((item.repo().into(), item.repo().into()));
         }
-        let org = self.org.as_deref();
-        for name in &repos.names {
-            if org.is_some() && name.split('/').next() != org {
-                continue;
-            }
-            if !items.iter().any(|i| &i.1 == name) {
-                items.push((name.clone(), name.clone()));
+        let names = if self.scope.is_empty() {
+            self.known_repos()
+        } else {
+            self.scope.clone()
+        };
+        for name in names {
+            if !items.contains(&name) {
+                items.push(name);
             }
         }
-        self.picker(title.into(), items, 0, pick);
+        if items.is_empty() {
+            self.error("the repository list is not loaded yet; press R to retry");
+            return;
+        }
+        self.picker("Choose repository".into(), items, 0, Pick::Target(act));
+    }
+
+    /// Known repositories of the chosen organizations.
+    fn known_repos(&self) -> Vec<Choice> {
+        let names = self.repos.iter().flat_map(|r| &r.names);
+        names
+            .filter(|n| self.in_orgs(n))
+            .map(|n| (n.clone(), n.clone()))
+            .collect()
+    }
+
+    fn in_orgs(&self, repo: &str) -> bool {
+        let owner = repo.split('/').next().unwrap_or("");
+        self.orgs.is_empty() || self.orgs.iter().any(|o| o.1 == owner)
+    }
+
+    fn pick_scope(&mut self) {
+        if self.repos.is_none() {
+            self.error("the repository list is not loaded yet; press R to retry");
+            return;
+        }
+        let mut items = self.known_repos();
+        // Chosen ones first; one from the command line may not be in the list.
+        items.retain(|i| !self.scope.contains(i));
+        items.splice(0..0, self.scope.iter().cloned());
+        let marked = self.scope.clone();
+        self.multi_picker("Repositories", items, &marked, Pick::Scope);
     }
 
     fn pick_org(&mut self) {
@@ -783,23 +855,38 @@ impl App {
             self.error("the organization list is not loaded yet; press R to retry");
             return;
         };
-        let mut items = vec![("All".to_string(), String::new())];
-        items.extend(repos.orgs.iter().map(|o| (o.clone(), o.clone())));
-        items.push((format!("{} (personal)", repos.login), repos.login.clone()));
-        let sel = items
-            .iter()
-            .position(|i| Some(&i.1) == self.org.as_ref())
-            .unwrap_or_default();
-        self.picker("Show organization".into(), items, sel, Pick::Org);
+        let orgs = repos.orgs.iter().map(|o| (o.clone(), o.clone()));
+        let me = (format!("{} (personal)", repos.login), repos.login.clone());
+        let items = orgs.chain([me]).collect();
+        let marked = self.orgs.clone();
+        self.multi_picker("Organizations", items, &marked, Pick::Org);
     }
 
-    fn picker(&mut self, title: String, items: Vec<(String, String)>, sel: usize, pick: Pick) {
+    /// A picker for several choices, with an "All" row. Tabs without choices
+    /// have none to pick.
+    fn multi_picker(&mut self, title: &str, items: Vec<Choice>, marked: &[Choice], pick: Pick) {
+        if items.is_empty() {
+            return;
+        }
+        let mut all = vec![("All".to_string(), String::new())];
+        all.extend(items);
+        let sel = all.iter().position(|i| marked.contains(i));
+        self.picker(title.into(), all, sel.unwrap_or_default(), pick);
+        if let Some(Modal::Picker(p)) = &mut self.modal {
+            p.marked = marked.iter().map(|m| m.1.clone()).collect();
+        }
+    }
+
+    fn picker(&mut self, title: String, items: Vec<Choice>, sel: usize, pick: Pick) {
         self.modal = Some(Modal::Picker(Picker {
             title,
             items,
+            marked: Vec::new(),
             find: String::new(),
             sel,
             pick,
+            touched: false,
+            moved: false,
         }));
     }
 
@@ -832,18 +919,36 @@ impl App {
                 let count = p.view().len();
                 match key.code {
                     KeyCode::Esc => return,
+                    KeyCode::Enter if p.multi() => {
+                        if let Some(chosen) = p.chosen() {
+                            self.apply(p.pick, chosen);
+                        }
+                        return;
+                    }
+                    KeyCode::Char('x') if ctrl && p.multi() => {
+                        p.marked.clear();
+                        p.touched = true;
+                    }
+                    KeyCode::Char(' ') if p.multi() => p.toggle(),
                     KeyCode::Enter => {
                         let picked = p.view().get(p.sel).map(|i| i.1.clone());
                         if let Some(value) = picked {
                             return self.picked(p.pick, value);
                         }
                     }
-                    KeyCode::Down => p.sel = (p.sel + 1).min(count.saturating_sub(1)),
-                    KeyCode::Up => p.sel = p.sel.saturating_sub(1),
+                    KeyCode::Down => {
+                        p.sel = (p.sel + 1).min(count.saturating_sub(1));
+                        p.moved = true;
+                    }
+                    KeyCode::Up => {
+                        p.sel = p.sel.saturating_sub(1);
+                        p.moved = true;
+                    }
                     KeyCode::Char(_) | KeyCode::Backspace => {
                         let mut end = p.find.len();
                         form::edit(&mut p.find, &mut end, false, key);
                         p.sel = 0;
+                        p.moved = true;
                     }
                     _ => {}
                 }
@@ -856,8 +961,8 @@ impl App {
     fn clear_lists(&mut self) {
         for list in &mut self.lists {
             *list = List {
-                filter: list.filter.take(),
-                state: list.state,
+                filters: std::mem::take(&mut list.filters),
+                states: std::mem::take(&mut list.states),
                 job: list.job + 1, // ignore lists still in flight
                 ..List::default()
             };
@@ -865,25 +970,34 @@ impl App {
         self.reset();
     }
 
-    fn picked(&mut self, pick: Pick, value: String) {
+    fn apply(&mut self, pick: Pick, chosen: Vec<Choice>) {
         match pick {
             Pick::Org => {
-                self.org = Some(value).filter(|v| !v.is_empty());
-                self.scope = None;
+                self.orgs = chosen;
+                let mut scope = std::mem::take(&mut self.scope);
+                scope.retain(|r| self.in_orgs(&r.1));
+                self.scope = scope;
                 self.clear_lists();
             }
             Pick::Scope => {
-                self.scope = Some(value).filter(|v| !v.is_empty());
+                self.scope = chosen;
                 self.clear_lists();
             }
             Pick::Filter => {
-                let teams = self.repos.as_ref().map_or(&[][..], |r| &r.teams);
-                let chosen = api::filters(self.tab, teams)
-                    .into_iter()
-                    .find(|f| f.1 == value && !value.is_empty());
-                self.list_mut().filter = chosen;
+                self.list_mut().filters = chosen;
                 self.reset();
             }
+            Pick::State => {
+                self.list_mut().states = chosen;
+                self.reset();
+            }
+            Pick::Target(_) | Pick::Workflow(_) => {}
+        }
+    }
+
+    fn picked(&mut self, pick: Pick, value: String) {
+        match pick {
+            Pick::Org | Pick::Scope | Pick::Filter | Pick::State => {}
             Pick::Target(act) => self.target(act, value),
             Pick::Workflow(repo) => {
                 if let Some(form) = Form::new(self.tab, Act::Trigger, &repo, None, &value) {
@@ -1008,5 +1122,72 @@ mod tests {
         assert_eq!(form.text(0), "q");
         assert_eq!(form.error.as_deref(), Some("offline"));
         assert!(!app.quit);
+    }
+
+    #[test]
+    fn pickers_take_several_choices() {
+        let mut app = app();
+        app.scope.clear();
+        app.repos = Some(Repos {
+            login: "me".into(),
+            orgs: vec!["a".into(), "b".into()],
+            names: vec!["a/x".into(), "b/y".into(), "me/z".into()],
+            ..Repos::default()
+        });
+        let values =
+            |list: &[Choice]| -> Vec<String> { list.iter().map(|c| c.1.clone()).collect() };
+        let keys = |app: &mut App, keys: &[KeyCode]| keys.iter().for_each(|k| press(app, *k));
+        let (space, down) = (KeyCode::Char(' '), KeyCode::Down);
+        // Two marks.
+        keys(
+            &mut app,
+            &[KeyCode::Char('o'), down, space, down, space, KeyCode::Enter],
+        );
+        assert_eq!(values(&app.orgs), ["a", "b"]);
+        // Repositories are limited to the chosen organizations.
+        assert_eq!(values(&app.known_repos()), ["a/x", "b/y"]);
+        keys(
+            &mut app,
+            &[KeyCode::Char('p'), KeyCode::Char('y'), KeyCode::Enter],
+        );
+        assert_eq!(values(&app.scope), ["b/y"]);
+        // Enter right away changes nothing, Esc neither.
+        keys(&mut app, &[KeyCode::Char('o'), KeyCode::Enter]);
+        keys(&mut app, &[KeyCode::Char('o'), down, space, KeyCode::Esc]);
+        assert_eq!(values(&app.orgs), ["a", "b"]);
+        // Moving without marks chooses just that row; repositories elsewhere go.
+        keys(
+            &mut app,
+            &[KeyCode::Char('o'), KeyCode::Up, down, KeyCode::Enter],
+        );
+        assert_eq!(values(&app.orgs), ["a"]);
+        assert!(app.scope.is_empty());
+        // "All" clears.
+        keys(
+            &mut app,
+            &[KeyCode::Char('o'), KeyCode::Up, space, KeyCode::Enter],
+        );
+        assert!(app.orgs.is_empty());
+        keys(&mut app, &[KeyCode::Char('o'), down, space, KeyCode::Enter]);
+        assert_eq!(values(&app.orgs), ["a"]);
+        press(&mut app, KeyCode::Char('o'));
+        app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.orgs.is_empty());
+        // States: unmark Open, mark Merged and Closed.
+        keys(
+            &mut app,
+            &[
+                KeyCode::Char('s'),
+                space,
+                down,
+                space,
+                down,
+                space,
+                KeyCode::Enter,
+            ],
+        );
+        assert_eq!(app.list().states.len(), 2);
+        assert_eq!(app.list().states[0].0, "Merged");
     }
 }

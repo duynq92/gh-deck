@@ -315,26 +315,33 @@ pub struct Page {
     pub warning: Option<String>,
 }
 
-/// What a list should show.
+/// Label and value of something the user can choose.
+pub type Choice = (String, String);
+
+/// What a list should show. Choices in one field are alternatives; an empty
+/// field does not restrict anything.
 #[derive(Debug, Clone)]
 pub struct Query {
     pub tab: Tab,
-    /// An organization or the user.
-    pub org: Option<String>,
-    pub scope: Option<String>,
-    /// A search qualifier or `MY_TEAMS`.
-    pub filter: String,
-    pub state: usize,
+    /// Organizations, or the user.
+    pub orgs: Vec<Choice>,
+    pub repos: Vec<Choice>,
+    /// Search qualifiers or `MY_TEAMS`.
+    pub filters: Vec<Choice>,
+    pub states: Vec<Choice>,
     pub cursor: Option<String>,
 }
 
+fn choice(name: &str, value: &str) -> Choice {
+    (name.to_string(), value.to_string())
+}
+
 /// Filter names and values. Empty when the tab has no filters.
-pub fn filters(tab: Tab, teams: &[String]) -> Vec<(String, String)> {
-    let item = |name: &str, value: &str| (name.to_string(), value.to_string());
+pub fn filters(tab: Tab, teams: &[String]) -> Vec<Choice> {
+    let item = choice;
     match tab {
         Tab::Prs => {
             let mut all = vec![
-                item("All", ""),
                 item("Opened by me", "author:@me"),
                 item("Review requested: me", "user-review-requested:@me"),
             ];
@@ -349,7 +356,6 @@ pub fn filters(tab: Tab, teams: &[String]) -> Vec<(String, String)> {
             all
         }
         Tab::Issues => vec![
-            item("All", ""),
             item("Opened by me", "author:@me"),
             item("Assigned to me", "assignee:@me"),
             item("Involves me", "involves:@me"),
@@ -358,22 +364,31 @@ pub fn filters(tab: Tab, teams: &[String]) -> Vec<(String, String)> {
     }
 }
 
-pub fn states(tab: Tab) -> &'static [(&'static str, &'static str)] {
+/// State names and values. Empty when the tab has no states.
+pub fn states(tab: Tab) -> Vec<Choice> {
     match tab {
-        Tab::Prs => &[
-            ("Open", "is:open"),
-            ("Merged", "is:merged"),
-            ("Closed", "is:closed is:unmerged"),
-            ("All", ""),
+        Tab::Prs => vec![
+            choice("Open", "is:open"),
+            choice("Merged", "is:merged"),
+            choice("Closed", "(is:closed is:unmerged)"),
         ],
-        Tab::Issues => &[("Open", "is:open"), ("Closed", "is:closed"), ("All", "")],
-        Tab::Releases => &[("All", "")],
-        Tab::Runs => &[
-            ("All", ""),
-            ("Failed", "failure"),
-            ("Running", "in_progress"),
-            ("Queued", "queued"),
+        Tab::Issues => vec![choice("Open", "is:open"), choice("Closed", "is:closed")],
+        Tab::Releases => Vec::new(),
+        Tab::Runs => vec![
+            choice("Failed", "failure"),
+            choice("Running", "in_progress"),
+            choice("Queued", "queued"),
+            choice("Succeeded", "success"),
+            choice("Cancelled", "cancelled"),
         ],
+    }
+}
+
+/// Pull requests and issues start with the open ones.
+pub fn default_states(tab: Tab) -> Vec<Choice> {
+    match tab {
+        Tab::Prs | Tab::Issues => states(tab).into_iter().take(1).collect(),
+        Tab::Releases | Tab::Runs => Vec::new(),
     }
 }
 
@@ -473,45 +488,55 @@ pub fn list(q: &Query, repos: &Repos) -> Result<Page> {
     }
 }
 
-/// Search type and query.
-fn search_query(q: &Query, repos: &Repos) -> (&'static str, String) {
+/// `a`, `(a OR b)` or nothing.
+fn any_of(parts: Vec<String>) -> String {
+    match parts.as_slice() {
+        [] => String::new(),
+        [one] => one.clone(),
+        many => format!("({})", many.join(" OR ")),
+    }
+}
+
+/// Query for GitHub's advanced issue search, the one that understands OR.
+fn search_query(q: &Query, repos: &Repos) -> String {
     let kind = if q.tab == Tab::Prs {
         "is:pr"
     } else {
         "is:issue"
     };
-    let place = match (&q.scope, &q.org) {
-        (Some(repo), _) => format!("repo:{repo}"),
-        (None, Some(org)) => format!("user:{org}"),
-        (None, None) if q.filter.is_empty() => repos
-            .orgs
-            .iter()
-            .fold(format!("user:{}", repos.login), |all, org| {
-                all + " org:" + org
-            }),
-        // "Mine" filters are not limited to known repositories.
-        (None, None) => String::new(),
-    };
-    // Only the advanced search understands OR.
-    let (search, filter) = if q.filter == MY_TEAMS {
-        let teams: Vec<String> = repos
-            .teams
-            .iter()
-            .map(|t| format!("team-review-requested:{t}"))
-            .collect();
-        ("ISSUE_ADVANCED", format!("({})", teams.join(" OR ")))
+    let place = if !q.repos.is_empty() {
+        q.repos.iter().map(|r| format!("repo:{}", r.1)).collect()
+    } else if !q.orgs.is_empty() {
+        q.orgs.iter().map(|o| format!("user:{}", o.1)).collect()
+    } else if q.filters.is_empty() {
+        [&repos.login]
+            .into_iter()
+            .chain(&repos.orgs)
+            .map(|o| format!("user:{o}"))
+            .collect()
     } else {
-        ("ISSUE", q.filter.clone())
+        // "Mine" filters are not limited to known repositories.
+        Vec::new()
     };
+    let mut filters = Vec::new();
+    for (_, value) in &q.filters {
+        if value == MY_TEAMS {
+            let teams = repos.teams.iter();
+            filters.extend(teams.map(|t| format!("team-review-requested:{t}")));
+        } else {
+            filters.push(value.clone());
+        }
+    }
+    filters.dedup();
     let parts = [
-        kind,
-        &place,
-        &filter,
-        states(q.tab)[q.state].1,
-        "archived:false sort:updated-desc",
+        kind.to_string(),
+        any_of(place),
+        any_of(filters),
+        any_of(q.states.iter().map(|s| s.1.clone()).collect()),
+        "archived:false sort:updated-desc".to_string(),
     ];
-    let parts: Vec<&str> = parts.into_iter().filter(|s| !s.is_empty()).collect();
-    (search, parts.join(" "))
+    let parts: Vec<String> = parts.into_iter().filter(|s| !s.is_empty()).collect();
+    parts.join(" ")
 }
 
 const TICKET: &str = "number title state updatedAt url body author{login} \
@@ -529,9 +554,9 @@ fn tickets(q: &Query, repos: &Repos) -> Result<Page> {
     } else {
         format!("... on Issue{{{TICKET}}}")
     };
-    let (search_type, search) = search_query(q, repos);
+    let search = search_query(q, repos);
     let query = format!(
-        "query=query($q:String!,$after:String){{search(type:{search_type},first:{SEARCH_PAGE},query:$q,\
+        "query=query($q:String!,$after:String){{search(type:ISSUE_ADVANCED,first:{SEARCH_PAGE},query:$q,\
          after:$after){{issueCount pageInfo{{hasNextPage endCursor}} nodes{{{kind}}}}}}}"
     );
     let search = format!("q={search}");
@@ -551,11 +576,11 @@ fn tickets(q: &Query, repos: &Repos) -> Result<Page> {
     ]);
     let out: Out = fetch(&list)?;
     // The search index lags behind changes; trust the live state instead.
-    let state = states(q.tab)[q.state].0.to_uppercase();
+    let wanted: Vec<String> = q.states.iter().map(|s| s.0.to_uppercase()).collect();
     let items = out
         .items
         .into_iter()
-        .filter(|t| state == "ALL" || t.state == state)
+        .filter(|t| wanted.is_empty() || wanted.contains(&t.state))
         .map(Item::Ticket)
         .collect();
     Ok(Page {
@@ -576,50 +601,45 @@ fn releases(q: &Query) -> Result<Page> {
     let map = "[.[]|.nameWithOwner as $r|.releases.nodes[]|{repo:$r,tag:.tagName,name,\
          draft:.isDraft,prerelease:.isPrerelease,updated:(.publishedAt//.createdAt),url,\
          body:.description,author:.author.login}]|sort_by(.updated)|reverse";
-    let list: Vec<Release> = match &q.scope {
-        Some(repo) => {
+    // One aliased field per repository or owner, all in a single request.
+    let order = "orderBy:{field:PUSHED_AT,direction:DESC}";
+    let (query, nodes) = if !q.repos.is_empty() {
+        let count = if q.repos.len() == 1 { PAGE } else { 10 };
+        let mut query = String::new();
+        for (n, (_, repo)) in q.repos.iter().enumerate() {
             let (owner, name) = split(repo)?;
-            fetch(&[
-                "api",
-                "graphql",
-                "-f",
-                &format!(
-                    "query=query($o:String!,$n:String!){{repository(owner:$o,name:$n){{{}}}}}",
-                    fields(PAGE)
-                ),
-                "-f",
-                &format!("o={owner}"),
-                "-f",
-                &format!("n={name}"),
-                "--jq",
-                &format!("[.data.repository]|{map}"),
-            ])?
+            query += &format!(
+                "r{n}:repository(owner:\"{owner}\",name:\"{name}\"){{{}}} ",
+                fields(count)
+            );
         }
-        None => {
-            // `viewer` spans everything; an owner narrows to its repositories.
-            let (root, mine) = match &q.org {
-                Some(org) => (format!("repositoryOwner(login:\"{org}\")"), "OWNER"),
-                None => ("viewer".into(), ALL_REPOS),
-            };
-            let affiliations = match q.org {
-                Some(_) => String::new(),
-                None => format!("affiliations:[{ALL_REPOS}],"),
-            };
-            fetch(&[
-                "api",
-                "graphql",
-                "-f",
-                &format!(
-                    "query={{o:{root}{{repositories(first:50,{affiliations}\
-                     ownerAffiliations:[{mine}],\
-                     orderBy:{{field:PUSHED_AT,direction:DESC}}){{nodes{{{}}}}}}}}}",
-                    fields(3)
-                ),
-                "--jq",
-                &format!(".data.o.repositories.nodes|{map}"),
-            ])?
+        (query, "[.data[]|select(.)]")
+    } else if !q.orgs.is_empty() {
+        let mut query = String::new();
+        for (n, (_, org)) in q.orgs.iter().enumerate() {
+            query += &format!(
+                "o{n}:repositoryOwner(login:\"{org}\"){{repositories(first:50,\
+                 ownerAffiliations:[OWNER],{order}){{nodes{{{}}}}}}} ",
+                fields(3)
+            );
         }
+        (query, "[.data[]|select(.)|.repositories.nodes[]]")
+    } else {
+        let query = format!(
+            "viewer{{repositories(first:50,affiliations:[{ALL_REPOS}],\
+             ownerAffiliations:[{ALL_REPOS}],{order}){{nodes{{{}}}}}}}",
+            fields(3)
+        );
+        (query, "[.data[].repositories.nodes[]]")
     };
+    let list: Vec<Release> = fetch(&[
+        "api",
+        "graphql",
+        "-f",
+        &format!("query={{{query}}}"),
+        "--jq",
+        &format!("{nodes}|{map}"),
+    ])?;
     let total = list.len();
     Ok(Page {
         items: list.into_iter().map(Item::Release).collect(),
@@ -648,26 +668,40 @@ fn repo_runs(repo: &str, status: &str, count: usize) -> Result<Vec<Run>> {
 }
 
 fn runs(q: &Query, repos: &Repos) -> Result<Page> {
-    let status = states(q.tab)[q.state].1;
-    let names: Vec<&str> = match &q.scope {
-        Some(repo) => vec![repo],
+    let names: Vec<&str> = if q.repos.is_empty() {
         // REST has no cross-repository endpoint: one request per recent repository.
-        None => repos
+        let owner = |n: &str| n.split('/').next().unwrap_or("").to_string();
+        repos
             .names
             .iter()
-            .filter(|n| q.org.is_none() || n.split('/').next() == q.org.as_deref())
+            .filter(|n| q.orgs.is_empty() || q.orgs.iter().any(|o| o.1 == owner(n)))
             .take(RUN_REPOS)
             .map(String::as_str)
-            .collect(),
+            .collect()
+    } else {
+        q.repos.iter().map(|r| r.1.as_str()).collect()
     };
-    let count = if q.scope.is_some() { PAGE } else { 5 };
+    let count = match names.len() {
+        1 => PAGE,
+        2..=5 => 15,
+        _ => 5,
+    };
+    // The endpoint takes a single status.
+    let statuses: Vec<&str> = match q.states.as_slice() {
+        [] => vec![""],
+        many => many.iter().map(|s| s.1.as_str()).collect(),
+    };
+    let jobs: Vec<(&str, &str)> = names
+        .iter()
+        .flat_map(|n| statuses.iter().map(move |s| (*n, *s)))
+        .collect();
     let mut all = Vec::new();
     let mut errors = Vec::new();
-    for batch in names.chunks(PARALLEL) {
+    for batch in jobs.chunks(PARALLEL) {
         let results: Vec<_> = thread::scope(|s| {
             let handles: Vec<_> = batch
                 .iter()
-                .map(|repo| s.spawn(move || repo_runs(repo, status, count)))
+                .map(|(repo, status)| s.spawn(move || repo_runs(repo, status, count)))
                 .collect();
             handles
                 .into_iter()
@@ -677,7 +711,7 @@ fn runs(q: &Query, repos: &Repos) -> Result<Page> {
                 })
                 .collect()
         });
-        for (repo, result) in batch.iter().zip(results) {
+        for ((repo, _), result) in batch.iter().zip(results) {
             match result {
                 Ok(runs) => all.extend(runs),
                 Err(e) => errors.push(format!("{repo}: {e}")),
@@ -693,7 +727,7 @@ fn runs(q: &Query, repos: &Repos) -> Result<Page> {
         items: all.into_iter().map(Item::Run).collect(),
         cursor: None,
         warning: (!errors.is_empty())
-            .then(|| format!("{} repos failed: {}", errors.len(), errors.join("; "))),
+            .then(|| format!("{} requests failed: {}", errors.len(), errors.join("; "))),
     })
 }
 
@@ -1181,40 +1215,41 @@ mod tests {
 
     #[test]
     fn builds_search_queries() {
+        let pick =
+            |values: &[&str]| -> Vec<Choice> { values.iter().map(|v| choice(v, v)).collect() };
         let mut q = Query {
             tab: Tab::Prs,
-            org: None,
-            scope: None,
-            filter: String::new(),
-            state: 0,
+            orgs: vec![],
+            repos: vec![],
+            filters: vec![],
+            states: default_states(Tab::Prs),
             cursor: None,
         };
         let repos = Repos {
             login: "me".into(),
-            orgs: vec!["a".into(), "b".into()],
+            orgs: vec!["a".into()],
             teams: vec!["a/x".into(), "b/y".into()],
             names: vec![],
         };
-        let tail = "archived:false sort:updated-desc";
-        let check = |q: &Query, kind: &str, want: &str| {
-            let want = format!("is:pr {want} {tail}");
-            assert_eq!(search_query(q, &repos), (kind, want));
+        let check = |q: &Query, want: &str| {
+            let want = format!("is:pr {want} archived:false sort:updated-desc");
+            assert_eq!(search_query(q, &repos), want);
         };
-        check(&q, "ISSUE", "user:me org:a org:b is:open");
-        q.filter = "author:@me".into();
-        check(&q, "ISSUE", "author:@me is:open");
-        q.org = Some("a".into());
-        check(&q, "ISSUE", "user:a author:@me is:open");
-        q.filter = MY_TEAMS.into();
+        check(&q, "(user:me OR user:a) is:open");
+        q.filters = pick(&["author:@me"]);
+        check(&q, "author:@me is:open");
+        q.orgs = pick(&["a", "b"]);
+        q.filters = pick(&["author:@me", MY_TEAMS]);
+        q.states = states(Tab::Prs);
         check(
             &q,
-            "ISSUE_ADVANCED",
-            "user:a (team-review-requested:a/x OR team-review-requested:b/y) is:open",
+            "(user:a OR user:b) (author:@me OR team-review-requested:a/x OR \
+             team-review-requested:b/y) (is:open OR is:merged OR (is:closed is:unmerged))",
         );
-        q.scope = Some("o/r".into());
-        q.filter.clear();
-        q.state = 3;
-        check(&q, "ISSUE", "repo:o/r");
+        q.repos = pick(&["o/r", "o/s"]);
+        q.filters.clear();
+        q.states.clear();
+        check(&q, "(repo:o/r OR repo:o/s)");
     }
 
     #[test]

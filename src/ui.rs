@@ -1,6 +1,6 @@
 //! Drawing. Every label that has a shortcut shows it.
 
-use crate::api::{self, Item, Reviews};
+use crate::api::{self, Choice, Item, Reviews};
 use crate::app::{App, Modal, Picker, Status};
 use crate::doc::{GUTTER, Kind as LineKind, clean};
 use crate::form::{Form, Kind, line_at};
@@ -120,26 +120,56 @@ fn draw_body(frame: &mut Frame, app: &mut App, body: Rect) {
     draw_doc(frame, app, doc);
 }
 
+#[derive(Clone, Copy)]
+enum TabSize {
+    Full,
+    Short,
+    Tiny,
+}
+
+/// `All`, `name`, `name +2`, or just the count when there is no room.
+fn summary(chosen: &[Choice], longest: usize) -> String {
+    let text = match chosen {
+        [] => return "All".into(),
+        [one] => clean(&one.0).into_owned(),
+        [first, rest @ ..] => {
+            let text = format!("{} +{}", clean(&first.0), rest.len());
+            if text.width() > longest {
+                return chosen.len().to_string();
+            }
+            text
+        }
+    };
+    fit(&text, text.width().min(longest.max(3)))
+}
+
 /// Tabs on the left, what is shown on the right, always on one row.
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let width = area.width as usize;
     let list = app.list();
-    let mut values: Vec<(&str, &str, char)> = Vec::new();
-    for k in SCOPE.keys {
-        let value = match k.act {
-            Act::Org => app.org.as_deref().unwrap_or("All"),
-            Act::Repo => app.scope.as_deref().unwrap_or("All"),
-            Act::Filter if api::filters(app.tab, &[]).is_empty() => continue,
-            Act::Filter => list.filter.as_ref().map_or("All", |f| f.0.as_str()),
-            _ if api::states(app.tab).len() < 2 => continue,
-            _ => api::states(app.tab)[list.state].0,
-        };
-        values.push((k.label, value, k.key));
-    }
-    let tabs = |short: bool| {
+    let values: Vec<(&str, &[Choice], char)> = SCOPE
+        .keys
+        .iter()
+        .filter_map(|k| {
+            let chosen = match k.act {
+                Act::Org => &app.orgs,
+                Act::Repo => &app.scope,
+                Act::Filter if api::filters(app.tab, &[]).is_empty() => return None,
+                Act::Filter => &list.filters,
+                _ if api::states(app.tab).is_empty() => return None,
+                _ => &list.states,
+            };
+            Some((k.label, chosen.as_slice(), k.key))
+        })
+        .collect();
+    let tabs = |size: TabSize| {
         let mut spans = Vec::new();
         for (i, tab) in Tab::ALL.into_iter().enumerate() {
-            let name = if short { tab.short() } else { tab.title() };
+            let name = match size {
+                TabSize::Full => format!(" {} ", tab.title()),
+                TabSize::Short => format!(" {} ", tab.short()),
+                TabSize::Tiny => format!("{} ", tab.tiny()),
+            };
             let style = if tab == app.tab {
                 Style::new()
                     .fg(Color::Black)
@@ -149,41 +179,44 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
                 Style::new()
             };
             spans.push(key(&(i + 1).to_string()));
-            spans.push(Span::styled(format!(" {name} "), style));
+            spans.push(Span::styled(name, style));
         }
         Line::from(spans)
     };
-    let right = |labels: bool, longest: usize| {
+    // Every value keeps its key and label; only the values get shorter.
+    let right = |gap: &'static str, longest: usize| {
         let mut spans = Vec::new();
-        for (label, value, k) in &values {
+        for (label, chosen, k) in &values {
             spans.push(key(&k.to_string()));
-            if labels {
-                spans.push(Span::styled(format!(" {label}:"), DIM));
-            }
-            let text = fit(value, clean(value).width().min(longest));
-            let style = if *value == "All" {
+            spans.push(Span::raw(format!("{gap}{label}:")));
+            let style = if chosen.is_empty() {
                 BOLD
             } else {
                 Style::new().fg(Color::Green).add_modifier(Modifier::BOLD)
             };
-            spans.push(Span::styled(text, style));
+            spans.push(Span::styled(summary(chosen, longest), style));
             spans.push(Span::raw(" "));
         }
         Line::from(spans)
     };
-    // The widest variant that fits; values shrink before anything disappears.
-    let (left, right) = [(false, true, 18), (true, true, 12), (true, false, 12)]
-        .into_iter()
-        .flat_map(|(short, labels, min)| {
-            [40, 30, 24, 18, 12].map(move |n| (short, labels, n, n >= min))
-        })
-        .filter(|v| v.3)
-        .map(|(short, labels, n, _)| (tabs(short), right(labels, n)))
-        .find(|(l, r)| l.width() + r.width() < width)
-        .unwrap_or_else(|| {
-            let room = width.saturating_sub(tabs(true).width() + values.len() * 4 + 1);
-            (tabs(true), right(false, (room / values.len()).max(3)))
-        });
+    let sizes = [
+        (TabSize::Full, " ", 18),
+        (TabSize::Short, " ", 12),
+        (TabSize::Tiny, " ", 4),
+        (TabSize::Tiny, "", 1),
+    ];
+    let mut best = (tabs(TabSize::Tiny), right(" ", 1));
+    'fit: for (size, gap, min) in sizes {
+        for longest in (min..=40).rev() {
+            let (l, r) = (tabs(size), right(gap, longest));
+            let fits = l.width() + r.width() < width;
+            best = (l, r);
+            if fits {
+                break 'fit;
+            }
+        }
+    }
+    let (left, right) = best;
     frame.render_widget(left, area);
     let len = (right.width() as u16).min(area.width);
     let area = Rect::new(area.right() - len, area.y, len, area.height);
@@ -222,7 +255,7 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
     ]));
     let mut inner = block.inner(area);
     frame.render_widget(block, area);
-    let columns = Columns::new(app.tab, inner.width as usize, app.scope.is_some());
+    let columns = Columns::new(app.tab, inner.width as usize, app.scope.len() == 1);
     if inner.height > 3 {
         let header = Rect { height: 1, ..inner };
         frame.render_widget(columns.header(app.tab).style(HEAD), header);
@@ -768,15 +801,31 @@ fn draw_help(frame: &mut Frame, tab: Tab) {
 
 fn draw_picker(frame: &mut Frame, picker: &Picker) {
     let height = frame.area().height.saturating_sub(4).min(24);
-    let block = pane(true)
-        .title(Line::styled(format!(" {} ", picker.title), BOLD))
-        .title_bottom(hints(&[
+    let multi = picker.multi();
+    let keys: &[(&str, &str)] = if multi {
+        &[
+            ("type", "Find"),
+            ("Space", "Mark"),
+            ("^X", "Clear"),
+            ("Enter", "Apply"),
+            ("Esc", "Cancel"),
+        ]
+    } else {
+        &[
             ("type", "Find"),
             ("↑/↓", "Move"),
             ("Enter", "Choose"),
             ("Esc", "Cancel"),
-        ]));
-    let inner = popup(frame, 64, height, block);
+        ]
+    };
+    let title = match picker.marked.len() {
+        0 => format!(" {} ", picker.title),
+        n => format!(" {} ({n} marked) ", picker.title),
+    };
+    let block = pane(true)
+        .title(Line::styled(title, BOLD))
+        .title_bottom(hints(keys));
+    let inner = popup(frame, 70, height, block);
     let width = inner.width as usize;
     let mut lines = vec![Line::from(vec![
         Span::styled("> ", KEY),
@@ -791,7 +840,12 @@ fn draw_picker(frame: &mut Frame, picker: &Picker) {
         } else {
             Style::new()
         };
-        lines.push(Line::styled(fit(&item.0, width), style));
+        let (text, style) = match (multi, picker.is_marked(&item.1)) {
+            (false, _) => (item.0.clone(), style),
+            (true, true) => (format!("[x] {}", item.0), style.fg(Color::Green)),
+            (true, false) => (format!("[ ] {}", item.0), style),
+        };
+        lines.push(Line::styled(fit(&text, width), style));
     }
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -932,7 +986,10 @@ mod tests {
         for tab in Tab::ALL {
             app.tab = tab;
             let text = screen(&mut app, 80, 24);
-            assert!(text.contains("[o]") && text.contains("[p]"), "{tab:?}");
+            assert!(
+                text.contains("Org:All") && text.contains("Repo:All"),
+                "{tab:?}"
+            );
             for k in keys::groups(tab)
                 .iter()
                 .chain([&GLOBAL])
@@ -966,15 +1023,29 @@ mod tests {
     #[test]
     fn header_stays_on_one_row() {
         let mut app = App::new(mpsc::channel().0, Some("some-owner/some-repository".into()));
-        app.org = Some("some-owner".into());
+        let choice = |v: &str| (v.to_string(), v.to_string());
+        app.orgs = vec![choice("some-owner"), choice("other")];
+        app.lists[0].filters = vec![choice("Opened by me"), choice("Involves me"), choice("x")];
         for (width, texts) in [
-            (80, &["[1]", "[4]", "[o]", "[p]", "[f]", "[s]"][..]),
             (
-                160,
+                80,
+                &[
+                    "[1]PR",
+                    "[4]Act",
+                    "[o] Org:2",
+                    "[p] Repo:",
+                    "[f] Filter:3",
+                    "[s] State:",
+                ][..],
+            ),
+            (
+                180,
                 &[
                     "Pull Requests",
-                    "Repo:some-owner/some-repository",
-                    "State:Open",
+                    "[o] Org:some-owner +1",
+                    "[p] Repo:some-owner/some-repository",
+                    "[f] Filter:Opened by me +2",
+                    "[s] State:Open",
                 ],
             ),
         ] {

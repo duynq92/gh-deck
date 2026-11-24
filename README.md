@@ -41,6 +41,11 @@ Reviewer marks: `✓` approved, `✗` changes requested, `●` waiting, `·` com
 `-` dismissed. The `f` filters for pull requests are: opened by me, review
 requested from me, from any of my teams, or from one team, and involving me.
 
+`o`, `p`, `f` and `s` take several choices: `Space` marks, `Ctrl+X`
+clears, `Enter` applies. Choices
+in one selector are alternatives; the selectors narrow each other. Without marks,
+`Enter` chooses just the highlighted row.
+
 Close, delete, publish, rerun and cancel ask for `y` first. Merge and review
 actions open a form that is only sent with `Ctrl+S`.
 
@@ -58,7 +63,7 @@ actions open a form that is only sent with `Ctrl+S`.
   ones (one request each), 5 runs per repository.
 - The Releases tab without a chosen repository shows the 3 newest releases of the
   50 most recently pushed ones.
-- All tabs include your organizations; `o` narrows to one or to your own repositories.
+- All tabs include your organizations; `o` narrows to some or to your own repositories.
 - Reviewers, approval and checks of pull requests appear a few seconds after the list.
 - The repository picker lists the 500 most recently pushed; use
   `gh deck owner/repo` for others.
