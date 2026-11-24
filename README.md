@@ -30,7 +30,7 @@ Press `?` in the app for the current tab's shortcuts.
 
 | Where | Keys |
 |---|---|
-| Everywhere | `1`-`4`/`Tab` tabs, `j`/`k` move, `g`/`G` top/end, `Enter` open, `Esc` back, `o` organization, `p` repo, `f` filter, `s` state, `/` find, `>` more, `R` refresh, `?` help, `q` quit |
+| Everywhere | `1`-`4`/`Tab` tabs, `j`/`k` move, `g`/`G` top/end, `Enter` open, `Esc` back, `o` organization, `p` repo, `f` filter, `s` state, `/` find, `>` more, `R` refresh, `?` help, `!` last message, `q` quit |
 | Pull requests | `i` info, `d` diff, `n`/`N` next/previous file, `h` checks, `w` web, `a` approve, `x` request changes, `c` comment, `v` reviewers (your own PRs), `m` merge, `X` close/reopen, `b` checkout, `t` excluded teams |
 | Issues | `i` info, `w` web, `n` new, `c` comment, `l` labels, `a` assignees, `X` close/reopen |
 | Releases | `i` info, `w` web, `D` download, `n` new, `e` edit, `P` publish, `X` delete |
