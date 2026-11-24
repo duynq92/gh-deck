@@ -12,6 +12,15 @@ pub enum Tab {
 impl Tab {
     pub const ALL: [Tab; 4] = [Tab::Prs, Tab::Issues, Tab::Releases, Tab::Runs];
 
+    pub fn tiny(self) -> &'static str {
+        match self {
+            Tab::Prs => "PR",
+            Tab::Issues => "Iss",
+            Tab::Releases => "Rel",
+            Tab::Runs => "Act",
+        }
+    }
+
     pub fn short(self) -> &'static str {
         if self == Tab::Prs {
             "PRs"
