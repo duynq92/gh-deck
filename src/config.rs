@@ -1,5 +1,6 @@
 //! Saved settings: teams to leave out of "my teams", and what was shown last.
 
+use crate::ai::Settings;
 use crate::api::{self, Choice, valid_repo};
 use crate::keys::Tab;
 use serde::{Deserialize, Serialize};
@@ -84,6 +85,36 @@ pub fn save_view(path: &Path, view: &View) -> io::Result<()> {
     write(path, &serde_json::to_string_pretty(view)?)
 }
 
+/// Keys of the events that were seen, oldest first.
+pub fn load_seen(path: &Path) -> io::Result<Vec<String>> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(serde_json::from_str(&text)?),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
+pub fn save_seen(path: &Path, seen: &[String]) -> io::Result<()> {
+    write(path, &serde_json::to_string(seen)?)
+}
+
+/// Settings of the AI review; a missing file means none.
+pub fn load_ai(path: &Path) -> io::Result<Settings> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Settings::default()),
+        Err(e) => return Err(e),
+    };
+    let settings: Settings = serde_json::from_str(&text)?;
+    let bad = |e| io::Error::new(io::ErrorKind::InvalidData, e);
+    settings.check().map_err(bad)?;
+    Ok(settings)
+}
+
+pub fn save_ai(path: &Path, settings: &Settings) -> io::Result<()> {
+    write(path, &serde_json::to_string_pretty(settings)?)
+}
+
 /// Replaces the file in one step, so a crash cannot leave half of it.
 fn write(path: &Path, text: &str) -> io::Result<()> {
     if let Some(dir) = path.parent() {
@@ -137,6 +168,23 @@ mod tests {
         assert!(got.raw);
         fs::write(&path, "{").unwrap();
         assert!(load_view(&path).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ai_settings_survive() {
+        let dir = env::temp_dir().join(format!("ghdeck-ai-{}", std::process::id()));
+        let path = dir.join("ai.json");
+        assert_eq!(load_ai(&path).unwrap(), Settings::default());
+        let settings = Settings {
+            tool: Some(crate::ai::Tool::Claude),
+            blocked: vec!["o".into()],
+            ..Settings::default()
+        };
+        save_ai(&path, &settings).unwrap();
+        assert_eq!(load_ai(&path).unwrap(), settings);
+        fs::write(&path, "{\"model\":\"--x\"}").unwrap();
+        assert!(load_ai(&path).is_err());
         fs::remove_dir_all(&dir).unwrap();
     }
 }

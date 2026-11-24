@@ -7,10 +7,17 @@ pub enum Tab {
     Issues,
     Releases,
     Runs,
+    Activity,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 4] = [Tab::Prs, Tab::Issues, Tab::Releases, Tab::Runs];
+    pub const ALL: [Tab; 5] = [
+        Tab::Prs,
+        Tab::Issues,
+        Tab::Releases,
+        Tab::Runs,
+        Tab::Activity,
+    ];
 
     pub fn tiny(self) -> &'static str {
         match self {
@@ -18,6 +25,7 @@ impl Tab {
             Tab::Issues => "Iss",
             Tab::Releases => "Rel",
             Tab::Runs => "Act",
+            Tab::Activity => "New",
         }
     }
 
@@ -35,6 +43,7 @@ impl Tab {
             Tab::Issues => "Issues",
             Tab::Releases => "Releases",
             Tab::Runs => "Actions",
+            Tab::Activity => "Activity",
         }
     }
 }
@@ -52,10 +61,15 @@ pub enum Act {
     Refresh,
     Zoom,
     Raw,
+    Ai,
+    AiPost,
+    AiEdit,
     Lines,
     NextThread,
     PrevThread,
     Resolved,
+    Seen,
+    Bots,
     // Only in line mode
     LineComment,
     Reply,
@@ -155,58 +169,91 @@ pub const GLOBAL: Group = Group {
     ],
 };
 
+const PR_VIEW: Group = Group {
+    name: "View",
+    keys: &[
+        k('i', "Info", Act::Info),
+        k('d', "Diff", Act::Diff),
+        k('n', "Files", Act::NextFile),
+        k('N', "", Act::PrevFile),
+        k('h', "Checks", Act::Checks),
+        k('w', "Web", Act::Web),
+        k('M', "Raw text", Act::Raw),
+    ],
+};
+
+const PR_REVIEW: Group = Group {
+    name: "Review",
+    keys: &[
+        k('a', "Approve", Act::Approve),
+        k('x', "Request changes", Act::RequestChanges),
+        k('c', "Comment", Act::Comment),
+    ],
+};
+
+const PR_AI: Group = Group {
+    name: "AI",
+    keys: &[
+        k('A', "AI review", Act::Ai),
+        k('P', "Post findings", Act::AiPost),
+    ],
+};
+
+const PR_CODE: Group = Group {
+    name: "Code",
+    keys: &[
+        k('l', "Line comment", Act::Lines),
+        k('u', "Discussions", Act::NextThread),
+        k('U', "", Act::PrevThread),
+        k('O', "Resolved", Act::Resolved),
+    ],
+};
+
+const PR_MY_PR: Group = Group {
+    name: "My PR",
+    keys: &[
+        k('v', "Reviewers", Act::Reviewers),
+        k('r', "Ready", Act::Ready),
+        k('e', "Title", Act::Title),
+        k('E', "Description", Act::Description),
+        k('T', "Checkboxes", Act::Tasks),
+    ],
+};
+
+const PR_MANAGE: Group = Group {
+    name: "Manage",
+    keys: &[
+        k('m', "Merge", Act::Merge),
+        k('X', "Close/Reopen", Act::Toggle),
+        k('b', "Checkout", Act::Checkout),
+    ],
+};
+
+const PR_TEAMS: Group = Group {
+    name: "Teams",
+    keys: &[k('t', "Hide teams", Act::Exclude)],
+};
+
 const PRS: &[Group] = &[
+    PR_VIEW, PR_REVIEW, PR_AI, PR_CODE, PR_MY_PR, PR_MANAGE, PR_TEAMS,
+];
+
+/// Pull requests can be handled right where something happened.
+const ACTIVITY: &[Group] = &[
     Group {
-        name: "View",
+        name: "Activity",
         keys: &[
-            k('i', "Info", Act::Info),
-            k('d', "Diff", Act::Diff),
-            k('n', "Files", Act::NextFile),
-            k('N', "", Act::PrevFile),
-            k('h', "Checks", Act::Checks),
-            k('w', "Web", Act::Web),
-            k('M', "Raw text", Act::Raw),
+            k('S', "Mark all seen", Act::Seen),
+            k('B', "Show bots", Act::Bots),
         ],
     },
-    Group {
-        name: "Review",
-        keys: &[
-            k('a', "Approve", Act::Approve),
-            k('x', "Request changes", Act::RequestChanges),
-            k('c', "Comment", Act::Comment),
-        ],
-    },
-    Group {
-        name: "Code",
-        keys: &[
-            k('l', "Line comment", Act::Lines),
-            k('u', "Discussions", Act::NextThread),
-            k('U', "", Act::PrevThread),
-            k('O', "Resolved", Act::Resolved),
-        ],
-    },
-    Group {
-        name: "My PR",
-        keys: &[
-            k('v', "Reviewers", Act::Reviewers),
-            k('r', "Ready", Act::Ready),
-            k('e', "Title", Act::Title),
-            k('E', "Description", Act::Description),
-            k('T', "Checkboxes", Act::Tasks),
-        ],
-    },
-    Group {
-        name: "Manage",
-        keys: &[
-            k('m', "Merge", Act::Merge),
-            k('X', "Close/Reopen", Act::Toggle),
-            k('b', "Checkout", Act::Checkout),
-        ],
-    },
-    Group {
-        name: "Teams",
-        keys: &[k('t', "Hide teams", Act::Exclude)],
-    },
+    PR_VIEW,
+    PR_REVIEW,
+    PR_AI,
+    PR_CODE,
+    PR_MY_PR,
+    PR_MANAGE,
+    PR_TEAMS,
 ];
 
 const ISSUES: &[Group] = &[
@@ -281,6 +328,7 @@ pub fn groups(tab: Tab) -> &'static [Group] {
         Tab::Issues => ISSUES,
         Tab::Releases => RELEASES,
         Tab::Runs => RUNS,
+        Tab::Activity => ACTIVITY,
     }
 }
 
@@ -300,10 +348,24 @@ pub fn menu(tab: Tab) -> Vec<(usize, &'static Key)> {
 pub fn footer(tab: Tab, reading: bool) -> &'static [Act] {
     use Act::*;
     match (tab, reading) {
-        (Tab::Prs, true) => &[
+        (Tab::Activity, false) => &[
+            Seen,
+            Bots,
+            Comment,
+            Approve,
+            RequestChanges,
+            Merge,
+            Diff,
+            Find,
+            Web,
+            Refresh,
+        ],
+        (Tab::Prs | Tab::Activity, true) => &[
             NextFile,
             Lines,
             NextThread,
+            AiPost,
+            Ai,
             Zoom,
             Approve,
             RequestChanges,
@@ -374,7 +436,7 @@ mod tests {
     #[test]
     fn shortcuts_never_collide() {
         for tab in Tab::ALL {
-            let mut seen: HashSet<char> = "1234jkgG".chars().collect();
+            let mut seen: HashSet<char> = "12345jkgG".chars().collect();
             for key in groups(tab)
                 .iter()
                 .chain([&SCOPE, &GLOBAL])

@@ -1,6 +1,7 @@
 //! Discussions on lines of code: loading, posting, replying and resolving.
 
-use crate::gh::{self, Cmd, GhError, Result};
+use crate::ai::{Finding, Review};
+use crate::gh::{self, Cmd, GhError, Guard, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -146,7 +147,7 @@ pub struct NewComment {
     pub place: Place,
 }
 
-fn post(label: String, path: String, body: serde_json::Value) -> Cmd {
+fn send(label: String, path: String, body: serde_json::Value) -> Cmd {
     let args = [
         "api",
         "--method",
@@ -166,13 +167,103 @@ fn post(label: String, path: String, body: serde_json::Value) -> Cmd {
     }
 }
 
+/// Accepted findings, ready to be posted as one review.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Batch {
+    oid: String,
+    tool: String,
+    comments: Vec<serde_json::Value>,
+    /// Findings without a line go into the text of the review.
+    rest: Vec<String>,
+}
+
+impl Batch {
+    pub fn new(review: &Review) -> Self {
+        let (on, off): (Vec<&Finding>, Vec<&Finding>) = review
+            .findings
+            .iter()
+            .filter(|f| f.accepted)
+            .partition(|f| f.line.is_some());
+        Batch {
+            oid: review.oid.clone(),
+            tool: review.tool.clone(),
+            comments: on
+                .iter()
+                .map(|f| {
+                    serde_json::json!({"path": f.path, "line": f.line, "side": f.side,
+                        "body": f.text()})
+                })
+                .collect(),
+            rest: off
+                .iter()
+                .map(|f| format!("{}: {}", f.path, f.text()))
+                .collect(),
+        }
+    }
+
+    pub fn notes(&self) -> Vec<(bool, String)> {
+        let mut notes = vec![(true, "a comment review: neither approves nor blocks".into())];
+        let (on, off) = (self.comments.len(), self.rest.len());
+        if on > 0 {
+            notes.push((true, format!("{on} on lines of code")));
+        }
+        if off > 0 {
+            notes.push((true, format!("{off} in the text of the review")));
+        }
+        notes
+    }
+}
+
+/// `batch` is a serialized `Batch`.
+pub fn post(
+    repo: &str,
+    number: u64,
+    batch: &str,
+    summary: &str,
+    mention: bool,
+) -> std::result::Result<Cmd, String> {
+    let batch: Batch = serde_json::from_str(batch).map_err(|e| e.to_string())?;
+    let count = batch.comments.len() + batch.rest.len();
+    let mut parts: Vec<String> = vec![summary.trim().to_string()];
+    parts.extend(batch.rest);
+    if mention {
+        parts.push(format!(
+            "_AI-assisted review ({}); findings were accepted one by one before posting._",
+            batch.tool
+        ));
+    }
+    parts.retain(|p| !p.is_empty());
+    if parts.is_empty() {
+        parts.push("Review comments".into());
+    }
+    let body = serde_json::json!({"commit_id": batch.oid, "event": "COMMENT",
+        "body": parts.join("\n\n"), "comments": batch.comments});
+    let mut cmd = send(
+        format!("Post {count} findings to {repo}#{number}"),
+        format!("repos/{repo}/pulls/{number}/reviews"),
+        body,
+    );
+    // Not on commits that were never reviewed.
+    let args = [
+        "api",
+        &format!("repos/{repo}/pulls/{number}"),
+        "--jq",
+        ".head.sha|tojson",
+    ];
+    cmd.guard = Some(Guard {
+        args: args.map(String::from).to_vec(),
+        expected: batch.oid,
+    });
+    Ok(cmd)
+}
+
 /// `new` is a serialized `NewComment`.
 pub fn comment(repo: &str, number: u64, new: &str, text: &str) -> std::result::Result<Cmd, String> {
     let new: NewComment = serde_json::from_str(new).map_err(|e| e.to_string())?;
     let label = format!("Comment on {}", new.place.label());
     let mut body = serde_json::to_value(&new).map_err(|e| e.to_string())?;
     body["body"] = text.into();
-    Ok(post(
+    Ok(send(
         label,
         format!("repos/{repo}/pulls/{number}/comments"),
         body,
@@ -188,7 +279,7 @@ pub fn reply(
     let id: u64 = comment
         .parse()
         .map_err(|_| "this discussion cannot be replied to".to_string())?;
-    Ok(post(
+    Ok(send(
         format!("Reply in {repo}#{number}"),
         format!("repos/{repo}/pulls/{number}/comments/{id}/replies"),
         serde_json::json!({ "body": text }),
@@ -272,5 +363,48 @@ mod tests {
         assert!(toggle(&thread).args[3].contains("{resolveReviewThread("));
         thread.resolved = true;
         assert!(toggle(&thread).args[3].contains("{unresolveReviewThread("));
+    }
+
+    #[test]
+    fn findings_are_posted_as_one_comment_review() {
+        let finding = |line: Option<u32>, accepted: bool| Finding {
+            path: "a".into(),
+            line,
+            side: "LEFT".into(),
+            severity: "nit".into(),
+            title: "t \"q\"".into(),
+            body: "b".into(),
+            accepted,
+        };
+        let review = Review {
+            oid: "abc".into(),
+            tool: "X".into(),
+            findings: vec![
+                finding(Some(3), true),
+                finding(None, true),
+                finding(Some(4), false),
+            ],
+            ..Review::default()
+        };
+        let batch = Batch::new(&review);
+        assert_eq!(batch.notes().len(), 3);
+        let batch = serde_json::to_string(&batch).unwrap();
+        let cmd = post("o/r", 3, &batch, " hi ", true).unwrap();
+        assert_eq!(cmd.args[3], "repos/o/r/pulls/3/reviews");
+        let sent: serde_json::Value = serde_json::from_str(&cmd.stdin.unwrap()).unwrap();
+        assert_eq!(sent["event"], "COMMENT");
+        assert_eq!(sent["commit_id"], "abc");
+        let text = "**t \"q\"** (nit)\n\nb";
+        let one = serde_json::json!([{"path":"a","line":3,"side":"LEFT","body":text}]);
+        assert_eq!(sent["comments"], one);
+        let body = sent["body"].as_str().unwrap();
+        assert!(
+            body.starts_with(&format!("hi\n\na: {text}\n\n_AI-assisted")),
+            "{body}"
+        );
+        assert_eq!(cmd.guard.unwrap().expected, "abc");
+        let empty = serde_json::to_string(&Batch::new(&Review::default())).unwrap();
+        let sent = post("o/r", 3, &empty, "", false).unwrap().stdin.unwrap();
+        assert!(sent.contains("Review comments"));
     }
 }

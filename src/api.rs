@@ -1,6 +1,7 @@
 //! GitHub data: list queries, detail documents and mutating commands.
 //! `--jq` trims responses inside `gh`, so only displayed fields reach us.
 
+use crate::activity::{self, Event, Pull};
 use crate::doc::Source;
 use crate::form::Form;
 use crate::gh::{self, Cmd, GhError, Guard, Keep, Result};
@@ -125,6 +126,7 @@ pub enum Item {
     Ticket(Ticket),
     Release(Release),
     Run(Run),
+    Event(Event),
 }
 
 impl Item {
@@ -133,6 +135,7 @@ impl Item {
             Item::Ticket(t) => &t.repo,
             Item::Release(r) => &r.repo,
             Item::Run(r) => &r.repo,
+            Item::Event(e) => e.pr.repo(),
         }
     }
 
@@ -141,6 +144,7 @@ impl Item {
             Item::Ticket(t) => &t.url,
             Item::Release(r) => &r.url,
             Item::Run(r) => &r.url,
+            Item::Event(e) => e.pr.url(),
         }
     }
 
@@ -149,6 +153,7 @@ impl Item {
             Item::Ticket(t) => &t.updated,
             Item::Release(r) => &r.updated,
             Item::Run(r) => &r.updated,
+            Item::Event(e) => &e.at,
         }
     }
 
@@ -158,6 +163,7 @@ impl Item {
             Item::Ticket(t) => format!("{}#{}", t.repo, t.number),
             Item::Release(r) => format!("{} {}", r.repo, r.tag),
             Item::Run(r) => format!("{} run {}", r.repo, r.id),
+            Item::Event(e) => e.key.clone(),
         }
     }
 
@@ -169,6 +175,7 @@ impl Item {
                 _ => &r.tag,
             },
             Item::Run(r) => &r.title,
+            Item::Event(e) => &e.text,
         }
     }
 
@@ -183,16 +190,21 @@ impl Item {
             Item::Release(r) if r.draft => "draft",
             Item::Release(r) if r.prerelease => "pre",
             Item::Release(_) => "released",
+            Item::Event(e) => e.pr.state(),
             Item::Run(r) => r.conclusion.as_deref().unwrap_or(&r.status),
         }
     }
 
     /// Text used by the local find filter.
     pub fn matches(&self, needle: &str) -> bool {
+        if let Item::Event(e) = self {
+            return e.text.to_lowercase().contains(needle) || e.pr.matches(needle);
+        }
         let author = match self {
             Item::Ticket(t) => t.author.as_deref(),
             Item::Release(r) => r.author.as_deref(),
             Item::Run(r) => r.name.as_deref(),
+            Item::Event(_) => None,
         };
         let reviews = match self {
             Item::Ticket(t) => t.reviews.as_ref(),
@@ -285,6 +297,7 @@ impl Item {
                 date(&r.updated),
                 r.body.as_deref().unwrap_or("(no notes)")
             ),
+            Item::Event(e) => format!("{}\n{}", e.text, e.pr.preview()),
             Item::Run(r) => format!(
                 "{}\n{} · {}\nWorkflow: {}\nBranch: {}\nEvent: {} by @{}\nUpdated: {}",
                 r.title,
@@ -367,7 +380,7 @@ pub fn filters(tab: Tab, teams: &[String]) -> Vec<Choice> {
             item("Assigned to me", "assignee:@me"),
             item("Involves me", "involves:@me"),
         ],
-        Tab::Releases | Tab::Runs => Vec::new(),
+        Tab::Releases | Tab::Runs | Tab::Activity => Vec::new(),
     }
 }
 
@@ -375,7 +388,7 @@ pub fn filters(tab: Tab, teams: &[String]) -> Vec<Choice> {
 pub fn default_filters(tab: Tab) -> Vec<Choice> {
     match tab {
         Tab::Prs => filters(tab, &[]),
-        Tab::Issues | Tab::Releases | Tab::Runs => Vec::new(),
+        _ => Vec::new(),
     }
 }
 
@@ -388,7 +401,7 @@ pub fn states(tab: Tab) -> Vec<Choice> {
             choice("Closed", "(is:closed is:unmerged)"),
         ],
         Tab::Issues => vec![choice("Open", "is:open"), choice("Closed", "is:closed")],
-        Tab::Releases => Vec::new(),
+        Tab::Releases | Tab::Activity => Vec::new(),
         Tab::Runs => vec![
             choice("Failed", "failure"),
             choice("Running", "in_progress"),
@@ -403,7 +416,7 @@ pub fn states(tab: Tab) -> Vec<Choice> {
 pub fn default_states(tab: Tab) -> Vec<Choice> {
     match tab {
         Tab::Prs | Tab::Issues => states(tab).into_iter().take(1).collect(),
-        Tab::Releases | Tab::Runs => Vec::new(),
+        Tab::Releases | Tab::Runs | Tab::Activity => Vec::new(),
     }
 }
 
@@ -500,6 +513,7 @@ pub fn list(q: &Query, repos: &Repos) -> Result<Page> {
         Tab::Prs | Tab::Issues => tickets(q, repos),
         Tab::Releases => releases(q),
         Tab::Runs => runs(q, repos),
+        Tab::Activity => activity(q, repos),
     }
 }
 
@@ -554,6 +568,11 @@ fn search_query(q: &Query, repos: &Repos) -> String {
     parts.join(" ")
 }
 
+const TICKET_JQ: &str = "repo:.repository.nameWithOwner,number,title,state,\
+         updated:.updatedAt,url,body,author:.author.login,labels:[.labels.nodes[].name],\
+         assignees:[.assignees.nodes[].login],draft:(.isDraft//false),head:(.headRefName//\"\"),\
+         oid:(.headRefOid//\"\"),base:(.baseRefName//\"\"),id:(.id//\"\")";
+
 const TICKET: &str = "number title state updatedAt url body author{login} \
     repository{nameWithOwner} labels(first:20){nodes{name}} assignees(first:20){nodes{login}}";
 
@@ -588,15 +607,12 @@ fn tickets(q: &Query, repos: &Repos) -> Result<Page> {
     if let Some(after) = &after {
         list.extend(["-f", after]);
     }
-    list.extend([
-        "--jq",
-        ".data.search|{total:.issueCount,\
-         cursor:(if .pageInfo.hasNextPage then .pageInfo.endCursor else null end),\
-         items:[.nodes[]|select(.number)|{repo:.repository.nameWithOwner,number,title,state,\
-         updated:.updatedAt,url,body,author:.author.login,labels:[.labels.nodes[].name],\
-         assignees:[.assignees.nodes[].login],draft:(.isDraft//false),head:(.headRefName//\"\"),\
-         oid:(.headRefOid//\"\"),base:(.baseRefName//\"\"),id:(.id//\"\")}]}",
-    ]);
+    let jq = format!(
+        ".data.search|{{total:.issueCount,\
+             cursor:(if .pageInfo.hasNextPage then .pageInfo.endCursor else null end),\
+             items:[.nodes[]|select(.number)|{{{TICKET_JQ}}}]}}"
+    );
+    list.extend(["--jq", &jq]);
     let out: Out = fetch(&list)?;
     // The search index lags behind changes; trust the live state instead.
     let wanted: Vec<String> = q.states.iter().map(|s| s.0.to_uppercase()).collect();
@@ -611,6 +627,58 @@ fn tickets(q: &Query, repos: &Repos) -> Result<Page> {
         total: out.total,
         cursor: out.cursor,
         warning: None,
+    })
+}
+
+/// What happened on the newest pull requests that concern the user.
+fn activity(q: &Query, repos: &Repos) -> Result<Page> {
+    let mut q = q.clone();
+    q.tab = Tab::Prs;
+    q.states = Vec::new();
+    q.filters = [
+        "author:@me",
+        "user-review-requested:@me",
+        "reviewed-by:@me",
+        "commenter:@me",
+        "mentions:@me",
+        MY_TEAMS,
+    ]
+    .map(|f| choice(f, f))
+    .to_vec();
+    let query = format!(
+        "query=query($q:String!){{search(type:ISSUE_ADVANCED,first:{PAGE},query:$q){{nodes{{\
+         ...on PullRequest{{{TICKET} id isDraft headRefName headRefOid baseRefName {}}}}}}}}}",
+        activity::QUERY
+    );
+    let jq = format!(
+        "[.data.search.nodes[]|select(.number)|{{{TICKET_JQ},{}}}]",
+        activity::JQ
+    );
+    let search = format!("q={}", search_query(&q, repos));
+    let list = ["api", "graphql", "-f", &query, "-f", &search, "--jq", &jq];
+    let pulls: Vec<Pull> = fetch(&list)?;
+    let mine: Vec<Ticket> = pulls
+        .iter()
+        .map(|p| &p.ticket)
+        .filter(|t| t.state == "OPEN" && t.author.as_ref() == Some(&repos.login))
+        .take(25)
+        .cloned()
+        .collect();
+    let mut all = activity::events(pulls, &repos.login, &repos.teams);
+    let mut warning = None;
+    if !mine.is_empty() {
+        let ids: Vec<String> = mine.iter().map(|t| t.id.clone()).collect();
+        match reviews(&ids) {
+            Ok(reviews) => all.extend(activity::failed_checks(&mine, &reviews)),
+            Err(e) => warning = Some(format!("checks are not known: {e}")),
+        }
+    }
+    let items: Vec<Item> = activity::newest(all).into_iter().map(Item::Event).collect();
+    Ok(Page {
+        total: items.len(),
+        items,
+        cursor: None,
+        warning,
     })
 }
 
@@ -1421,6 +1489,10 @@ pub fn submit(form: &Form) -> std::result::Result<Cmd, String> {
         (Act::LineComment, Some(Item::Ticket(t))) => {
             need(0)?;
             return review::comment(&t.repo, t.number, &form.extra, text(0));
+        }
+        (Act::AiPost, Some(Item::Ticket(t))) => {
+            let (text, mention) = (text(0), form.toggle(1));
+            return review::post(&t.repo, t.number, &form.extra, text, mention);
         }
         (Act::Reply, Some(Item::Ticket(t))) => {
             need(0)?;

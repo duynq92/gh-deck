@@ -1,6 +1,6 @@
 [package]
 name = "ghdeck"
-version = "0.9.1"
+version = "0.10.0"
 edition = "2024"
 description = "Keyboard-driven TUI for GitHub, powered by the gh CLI"
 publish = false

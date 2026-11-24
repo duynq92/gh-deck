@@ -1,5 +1,6 @@
 //! Scrollable, lazily rendered text. Only visible rows are ever styled.
 
+use crate::ai::{Finding, Review};
 use crate::markdown::{self, Look};
 use crate::review::{Place, Thread};
 use std::borrow::Cow;
@@ -58,6 +59,9 @@ pub enum Kind {
     /// First line of an unresolved or resolved discussion.
     Open,
     Done,
+    /// First line of an AI finding, new or accepted.
+    Finding,
+    Accepted,
     /// The rest of a discussion.
     Note,
 }
@@ -65,7 +69,11 @@ pub enum Kind {
 impl Kind {
     /// Lines the cursor stops at.
     fn is_target(self) -> bool {
-        self.is_code() || matches!(self, Kind::Open | Kind::Done)
+        self.is_code()
+            || matches!(
+                self,
+                Kind::Open | Kind::Done | Kind::Finding | Kind::Accepted
+            )
     }
 
     pub fn is_code(self) -> bool {
@@ -95,6 +103,9 @@ pub struct Doc {
     files: Vec<(u32, String)>,
     /// Logical line and position of every discussion.
     threads: Vec<(u32, usize)>,
+    findings: Vec<(u32, usize)>,
+    /// The line that sums the findings up: not a stop.
+    findings_line: Option<u32>,
     /// Line mode: the current line, and where a range started.
     pub cursor: Option<u32>,
     pub anchor: Option<u32>,
@@ -130,11 +141,13 @@ pub struct Source {
     pub show_resolved: bool,
     /// Commit the diff belongs to.
     pub oid: String,
+    pub ai: Option<Review>,
 }
 
 #[derive(Debug, PartialEq)]
 pub enum Mark {
     Thread(usize),
+    Finding(usize),
     Line(String, Option<u32>, Option<u32>),
 }
 
@@ -164,6 +177,10 @@ impl Doc {
         let mut doc = Doc::default();
         let rendered = source.markdown && !raw;
         doc.prose(&clean(&source.head));
+        if let Some(ai) = &source.ai {
+            doc.line(&clean(&ai.summary()).replace('\n', " "), Kind::Finding);
+            doc.findings_line = Some(doc.kinds.len() as u32 - 1);
+        }
         let files = source.diff.as_deref().map(|d| parse(&clean(d)));
         if let Some(files) = &files {
             doc.summary(files);
@@ -183,6 +200,15 @@ impl Doc {
                 doc.line("── Discussions on other files", Kind::Heading);
             }
             doc.thread(n, thread, source, rendered);
+        }
+        let found = source.ai.iter().flat_map(|r| &r.findings).enumerate();
+        let known = |f: &Finding| files.iter().flatten().any(|c| c.path == f.path);
+        for (n, finding) in found.filter(|(_, f)| !known(f)) {
+            if std::mem::take(&mut first) {
+                doc.line("", Kind::Plain);
+                doc.line("── Discussions on other files", Kind::Heading);
+            }
+            doc.finding(n, finding, rendered);
         }
         doc.files_end = doc.kinds.len() as u32;
         doc.section(&source.tail, rendered);
@@ -328,6 +354,20 @@ impl Doc {
             }
             shown
         });
+        let outdated = source.ai.as_ref().is_some_and(|r| r.outdated);
+        let on = |f: &Finding, (old, new): &(Option<u32>, Option<u32>)| {
+            !outdated && f.line.is_some() && f.line == if f.side == "LEFT" { *old } else { *new }
+        };
+        let found = source.ai.iter().flat_map(|r| &r.findings).enumerate();
+        let mut found: Vec<(usize, &Finding)> =
+            found.filter(|(_, f)| f.path == file.path).collect();
+        found.retain(|(n, f)| {
+            let shown = lines.iter().any(|l| on(f, l));
+            if !shown {
+                self.finding(*n, f, rendered);
+            }
+            shown
+        });
         for ((kind, text), at) in file.lines.iter().zip(&lines) {
             self.line(text, *kind);
             // A context line has both numbers, but a thread only one place.
@@ -338,6 +378,51 @@ impl Doc {
                 }
                 !shown
             });
+            found.retain(|(n, f)| {
+                let shown = on(f, at);
+                if shown {
+                    self.finding(*n, f, rendered);
+                }
+                !shown
+            });
+        }
+    }
+
+    fn finding(&mut self, n: usize, finding: &Finding, rendered: bool) {
+        self.findings.push((self.kinds.len() as u32, n));
+        let (mark, kind) = if finding.accepted {
+            ("✓ accepted", Kind::Accepted)
+        } else {
+            ("not accepted", Kind::Finding)
+        };
+        let mut title = format!(
+            "{}┏ ◆ AI · {} · {mark} · {}",
+            " ".repeat(GUTTER),
+            finding.severity,
+            finding.title
+        );
+        if finding.line.is_none() {
+            title += " (not on a changed line)";
+        }
+        self.line(&clean(&title).replace('\n', " "), kind);
+        if let Some(hang) = self.hangs.last_mut() {
+            *hang = (GUTTER + 2) as u8;
+        }
+        self.note(&finding.body, rendered);
+    }
+
+    /// Body of a discussion or finding.
+    fn note(&mut self, body: &str, rendered: bool) {
+        let bar = " ".repeat(GUTTER) + "┃ ";
+        let body = clean(body);
+        if rendered {
+            return self.markdown(&body, &bar, Some(Kind::Note));
+        }
+        for line in body.split('\n') {
+            self.line(&format!("{bar}{line}"), Kind::Note);
+            if let Some(hang) = self.hangs.last_mut() {
+                *hang = (GUTTER + 2) as u8;
+            }
         }
     }
 
@@ -376,17 +461,7 @@ impl Doc {
             let from = start + bar.len();
             let to = from + 1 + who.len();
             self.styles.push((from as u32, to as u32, markdown::BOLD));
-            let body = clean(&c.body);
-            if rendered {
-                self.markdown(&body, &bar, Some(Kind::Note));
-            } else {
-                for line in body.split('\n') {
-                    self.line(&format!("{bar}{line}"), Kind::Note);
-                    if let Some(hang) = self.hangs.last_mut() {
-                        *hang = (GUTTER + 2) as u8;
-                    }
-                }
-            }
+            self.note(&c.body, rendered);
         }
         if thread.total > thread.comments.len() {
             let more = thread.total - thread.comments.len();
@@ -395,13 +470,53 @@ impl Doc {
     }
 
     pub fn has_threads(&self) -> bool {
-        !self.threads.is_empty()
+        !self.threads.is_empty() || !self.findings.is_empty()
     }
 
     /// The discussion under the cursor.
     pub fn thread_at_cursor(&self) -> Option<usize> {
         let line = self.cursor?;
         self.threads.iter().find(|t| t.0 == line).map(|t| t.1)
+    }
+
+    /// The AI finding under the cursor.
+    pub fn finding_at_cursor(&self) -> Option<usize> {
+        let line = self.cursor?;
+        self.findings.iter().find(|f| f.0 == line).map(|f| f.1)
+    }
+
+    /// The finding shown after this one, or before it when it is the last.
+    pub fn finding_next_to(&self, n: usize) -> Option<usize> {
+        let mut order = self.findings.clone();
+        order.sort_unstable();
+        let at = order.iter().position(|f| f.1 == n)?;
+        let next = order.get(at + 1).or_else(|| order.get(at.checked_sub(1)?));
+        next.map(|f| f.1)
+    }
+
+    /// Move the cursor to a finding, or to the first one.
+    pub fn go_to_finding(&mut self, n: Option<usize>, height: usize) -> bool {
+        let found = self.findings.iter().find(|f| n.is_none_or(|n| f.1 == n));
+        match found.map(|f| f.0) {
+            Some(line) => {
+                self.put(line, height);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn put(&mut self, line: u32, height: usize) {
+        self.cursor = Some(line);
+        self.anchor = None;
+        // Near the top, so that the whole text can be read.
+        let row = self.rows.partition_point(|r| r.line < line);
+        self.top = row.saturating_sub(height / 4);
+        self.scroll(0, height);
+    }
+
+    fn is_stop(&self, line: u32) -> bool {
+        self.kind(line).is_target() && self.findings_line != Some(line)
     }
 
     fn kind(&self, line: u32) -> Kind {
@@ -419,7 +534,7 @@ impl Doc {
     pub fn start_cursor(&mut self, height: usize) -> bool {
         let top = self.rows.get(self.top).map_or(0, |r| r.line);
         let end = self.kinds.len() as u32;
-        let target = |l: &u32| self.kind(*l).is_target();
+        let target = |l: &u32| self.is_stop(*l);
         let found = (top..end)
             .find(target)
             .or_else(|| (0..top).rev().find(target));
@@ -433,7 +548,7 @@ impl Doc {
         let Some(mut line) = self.cursor else { return };
         let end = self.kinds.len() as u32;
         for _ in 0..by.unsigned_abs().min(self.kinds.len()) {
-            let target = |l: &u32| self.kind(*l).is_target();
+            let target = |l: &u32| self.is_stop(*l);
             let next = if by > 0 {
                 (line + 1..end).find(target)
             } else {
@@ -451,7 +566,10 @@ impl Doc {
     /// Move the cursor to the next (or previous) discussion.
     pub fn jump_thread(&mut self, forward: bool, height: usize) -> bool {
         let top = self.rows.get(self.top).map(|r| r.line);
-        let lines = self.threads.iter().map(|t| t.0);
+        let mut lines: Vec<u32> = self.threads.iter().map(|t| t.0).collect();
+        lines.extend(self.findings.iter().map(|f| f.0));
+        lines.sort_unstable();
+        let lines = lines.iter().copied();
         let to = match (self.cursor, forward) {
             (Some(at), true) => lines.clone().find(|l| *l > at),
             (Some(at), false) => lines.clone().rev().find(|l| *l < at),
@@ -467,19 +585,17 @@ impl Doc {
                 lines.next_back()
             }
         });
-        if to.is_some() {
-            self.cursor = to;
-            self.anchor = None;
-            // Near the top, so that the whole discussion can be read.
-            let row = self.rows.partition_point(|r| Some(r.line) < to);
-            self.top = row.saturating_sub(height / 4);
-            self.scroll(0, height);
+        if let Some(line) = to {
+            self.put(line, height);
         }
         to.is_some()
     }
 
     /// What the cursor is at, to find it again in a newer document.
     pub fn mark(&self) -> Option<Mark> {
+        if let Some(n) = self.finding_at_cursor() {
+            return Some(Mark::Finding(n));
+        }
         match self.thread_at_cursor() {
             Some(n) => Some(Mark::Thread(n)),
             None => {
@@ -494,6 +610,7 @@ impl Doc {
     pub fn seek(&mut self, mark: &Mark, height: usize) {
         let found = match mark {
             Mark::Thread(n) => self.threads.iter().find(|t| t.1 == *n).map(|t| t.0),
+            Mark::Finding(n) => self.findings.iter().find(|f| f.1 == *n).map(|f| f.0),
             Mark::Line(path, old, new) => (0..self.kinds.len() as u32).find(|l| {
                 let kind = self.kind(*l);
                 kind.is_code()
@@ -804,6 +921,38 @@ fn unquote(path: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A changed file as text with line numbers, and which numbers it has.
+pub struct Changed {
+    pub path: String,
+    pub text: String,
+    /// Old and new line numbers, in order.
+    pub old: Vec<u32>,
+    pub new: Vec<u32>,
+}
+
+pub fn changed(diff: &str) -> Vec<Changed> {
+    let files = parse(&clean(diff)).into_iter();
+    files
+        .map(|file| {
+            let (mut old, mut new) = (Vec::new(), Vec::new());
+            let mut text = String::new();
+            for (kind, line) in &file.lines {
+                let (a, b) = numbers(*kind, line);
+                old.extend(a);
+                new.extend(b);
+                text.push_str(line);
+                text.push('\n');
+            }
+            Changed {
+                path: file.path,
+                text,
+                old,
+                new,
+            }
+        })
+        .collect()
 }
 
 /// Split a git diff into files, numbering every code line.
@@ -1273,5 +1422,77 @@ deleted file mode 100644
                 }
             }
         }
+    }
+
+    #[test]
+    fn findings_sit_under_their_line_and_are_stops() {
+        let finding = |path: &str, line: Option<u32>, title: &str| Finding {
+            path: path.into(),
+            line,
+            side: "RIGHT".into(),
+            severity: "major".into(),
+            title: title.into(),
+            body: "**b** \u{1b}[2J".into(),
+            accepted: title == "two",
+        };
+        let mut source = Source {
+            head: "T".into(),
+            diff: Some(DIFF.into()),
+            markdown: true,
+            threads: vec![thread("src/a b.rs", Some(1), "RIGHT", "talk")],
+            ai: Some(Review {
+                findings: vec![
+                    finding("src/a b.rs", Some(3), "one"),
+                    finding("src/a b.rs", None, "two"),
+                    finding("nope", None, "three"),
+                ],
+                ..Review::default()
+            }),
+            ..Source::default()
+        };
+        let mut doc = Doc::new(&source, false);
+        doc.layout(120);
+        let rows = all(&doc);
+        assert!(!rows.concat().contains('\u{1b}'));
+        let find = |t: &str| rows.iter().position(|r| r.contains(t)).unwrap();
+        assert_eq!(find("│ end") + 1, find("not accepted · one"));
+        assert!(find("accepted · two") < find("│ keep"));
+        assert!(find("· three") > find("gone  (deleted)"));
+        assert!(rows[1].contains("3 findings, 1 accepted"));
+        // Discussions and findings are visited in order.
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            doc.jump_thread(true, 9);
+            seen.push((doc.thread_at_cursor(), doc.finding_at_cursor()));
+        }
+        let want = [
+            (None, Some(1)),
+            (Some(0), None),
+            (None, Some(0)),
+            (None, Some(2)),
+        ];
+        assert_eq!(seen, want);
+        assert!(doc.place().is_err());
+        doc.start_cursor(99);
+        assert!(doc.finding_at_cursor().is_some() || doc.place().is_ok());
+        // Outdated findings leave their lines.
+        if let Some(ai) = &mut source.ai {
+            ai.outdated = true;
+        }
+        let mut doc = Doc::new(&source, false);
+        doc.layout(120);
+        let rows = all(&doc);
+        let find = |t: &str| rows.iter().position(|r| r.contains(t)).unwrap();
+        assert!(find("· one") < find("│ keep"));
+    }
+
+    #[test]
+    fn changed_lists_the_lines_of_the_diff() {
+        let files = changed(DIFF);
+        assert_eq!(
+            (&files[0].old, &files[0].new),
+            (&vec![1, 2, 3], &vec![1, 2, 3])
+        );
+        assert_eq!((&files[2].old, &files[2].new), (&vec![1], &vec![]));
     }
 }
