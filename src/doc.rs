@@ -224,11 +224,10 @@ impl Doc {
         for line in markdown::render(source) {
             // Entities such as `&#27;` may have brought control characters back.
             let safe = clean(&line.text);
-            let spans = if safe.len() == line.text.len() {
-                line.spans
-            } else {
-                Vec::new()
-            };
+            let mut spans = line.spans;
+            // Styling must never be able to cut a character in half.
+            spans.retain(|&(a, b, _)| *safe == *line.text && safe.get(a..b).is_some());
+            spans.sort_by_key(|s| s.0);
             let kind = kind.unwrap_or(match line.look {
                 Look::Text => Kind::Plain,
                 Look::Heading => Kind::Heading,
@@ -1151,5 +1150,44 @@ deleted file mode 100644
         assert_eq!(unquote(r#""b/vi\341\273\207t \"x\"""#), "b/việt \"x\"");
         let diff = "diff --git \"a/\\303\\251\" \"b/\\303\\251\"\nnew file mode 1\n--- /dev/null\n+++ \"b/\\303\\251\"\n@@ -0,0 +1 @@\n+x\n";
         assert_eq!(parse(diff)[0].path, "é");
+    }
+
+    /// Every combination of these pieces, at several widths and both modes.
+    #[test]
+    fn odd_markdown_never_panics() {
+        let pieces = [
+            "- ```\n  việt code\n  ```\n",
+            "-     indented\n",
+            "> - [x] ```x\n>   é\n>   ```\n",
+            "1. > quote **b•ld**\n",
+            "- [ ] ☐ `c•de` *i*\n  - ```\n    日本語\n    ```\n",
+            "| é | `•` |\n|---|---|\n| **日** | x |\n",
+            "# h **é** `•`\n",
+            "<details><summary>é &amp; •</summary>\n\n- a\n\n</details>\n",
+            "![é](u) [l•nk](x) ~~no~~ &#27;[31m&#x202e;\u{200b}\t\u{1f600}\n",
+            "```\n• unterminated\n",
+            "\n",
+        ];
+        let check = |source: &Source, raw: bool| {
+            for width in [2, 7, 30, 83] {
+                let mut doc = Doc::new(source, raw);
+                doc.layout(width);
+                for row in doc.visible(usize::MAX) {
+                    let _ = text(&row);
+                }
+            }
+        };
+        for a in pieces {
+            for b in pieces {
+                for c in pieces {
+                    let body = format!("{a}{b}{c}");
+                    let mut source = Source::preview(&format!("T\n\n{body}"));
+                    source.diff = Some(DIFF.into());
+                    source.threads = vec![thread("src/a b.rs", Some(3), "RIGHT", &body)];
+                    check(&source, false);
+                    check(&source, true);
+                }
+            }
+        }
     }
 }

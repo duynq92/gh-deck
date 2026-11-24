@@ -301,6 +301,7 @@ impl Render {
                 None => prefix.push_str("  "),
             }
         }
+        let marker_end = prefix.len();
         if self.code {
             prefix.push_str("  ");
         }
@@ -310,7 +311,7 @@ impl Render {
             spans.push((0, quote, DIM));
         }
         if let Some(marker) = &marker {
-            spans.push((at - marker.len(), at, BOLD));
+            spans.push((marker_end - marker.len(), marker_end, BOLD));
         }
         spans.extend(self.spans.drain(..).map(|(a, b, s)| (a + at, b + at, s)));
         self.lines.push(Line {
@@ -491,6 +492,13 @@ mod tests {
                 "[image: Evidence]"
             ]
         );
+    }
+
+    #[test]
+    fn code_in_a_list_keeps_its_marker() {
+        let lines = render("- ```\n  x\n  ```");
+        assert_eq!(lines[0].text, "•   x");
+        assert_eq!(lines[0].spans, [(0, "• ".len(), BOLD)]);
     }
 
     #[test]
