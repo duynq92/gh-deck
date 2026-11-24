@@ -2,7 +2,7 @@
 //! `--jq` trims responses inside `gh`, so only displayed fields reach us.
 
 use crate::form::Form;
-use crate::gh::{self, Cmd, GhError, Keep, Result};
+use crate::gh::{self, Cmd, GhError, Guard, Keep, Result};
 use crate::keys::{Act, Tab};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -988,6 +988,64 @@ fn lines(text: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Current text of a pull request.
+#[derive(Debug, Default, Deserialize)]
+pub struct PrText {
+    pub mine: bool,
+    pub title: String,
+    pub body: String,
+}
+
+fn text_query(repo: &str, number: u64, jq: &str) -> Result<Vec<String>> {
+    let (owner, name) = split(repo)?;
+    Ok(args(&[
+        "api",
+        "graphql",
+        "-f",
+        "query=query($o:String!,$n:String!,$number:Int!){repository(owner:$o,name:$n){\
+         pullRequest(number:$number){viewerDidAuthor title body}}}",
+        "-f",
+        &format!("o={owner}"),
+        "-f",
+        &format!("n={name}"),
+        "-F",
+        &format!("number={number}"),
+        "--jq",
+        &format!(".data.repository.pullRequest|{jq}"),
+    ]))
+}
+
+pub fn pr_text(repo: &str, number: u64) -> Result<PrText> {
+    let list = text_query(repo, number, "{mine:.viewerDidAuthor,title,body}")?;
+    let text = gh::run(&list, None, gh::JSON)?;
+    serde_json::from_str(&text).map_err(|e| GhError(format!("unexpected gh response: {e}")))
+}
+
+/// `field` is `title` or `body`. `tojson` keeps every byte of it.
+fn text_guard(repo: &str, number: u64, field: &str, expected: &str) -> Guard {
+    Guard {
+        // An invalid name cannot come from GitHub; an empty query would fail safely.
+        args: text_query(repo, number, &format!(".{field}|tojson")).unwrap_or_default(),
+        expected: expected.to_string(),
+    }
+}
+
+/// Replace a description that is still `old`.
+pub fn edit_body(repo: &str, number: u64, old: &str, new: String) -> Cmd {
+    Cmd {
+        label: format!("Edit description of {repo}#{number}"),
+        args: args(&[
+            "pr",
+            "edit",
+            &number.to_string(),
+            &format!("--repo={repo}"),
+            "--body-file=-",
+        ]),
+        stdin: Some(new),
+        guard: Some(text_guard(repo, number, "body", old)),
+    }
+}
+
 /// Who can be asked to review a pull request.
 #[derive(Debug, Default)]
 pub struct Candidates {
@@ -1111,6 +1169,7 @@ pub fn request_reviews(repo: &str, number: u64, old: &[String], new: &[String]) 
         label: format!("{repo}#{number}: {}", what.join("; ")),
         args: list,
         stdin: None,
+        guard: None,
     })
 }
 
@@ -1172,6 +1231,7 @@ pub fn simple(act: Act, item: &Item) -> Option<Cmd> {
         label: format!("{verb} {}", item.id()),
         args: list,
         stdin: None,
+        guard: None,
     })
 }
 
@@ -1192,6 +1252,7 @@ pub fn submit(form: &Form) -> std::result::Result<Cmd, String> {
         _ => String::new(),
     };
     let mut stdin = None;
+    let mut guard = None;
     let list = match (form.act, &form.item) {
         (Act::Comment, Some(Item::Ticket(t))) => {
             need(0)?;
@@ -1228,6 +1289,22 @@ pub fn submit(form: &Form) -> std::result::Result<Cmd, String> {
                 a.push("--delete-branch".into());
             }
             a
+        }
+        (Act::Title, Some(Item::Ticket(t))) => {
+            let title = need(0)?;
+            if title == t.title {
+                return Err("nothing changed".into());
+            }
+            guard = Some(text_guard(&t.repo, t.number, "title", &t.title));
+            args(&["pr", "edit", &number, &repo, &format!("--title={title}")])
+        }
+        (Act::Description, Some(Item::Ticket(t))) => {
+            // The editor uses plain newlines.
+            if text(0) == t.body.replace("\r\n", "\n") {
+                return Err("nothing changed".into());
+            }
+            let cmd = edit_body(&t.repo, t.number, &t.body, text(0).to_string());
+            return Ok(cmd);
         }
         (Act::Labels, Some(Item::Ticket(t))) => edit_list(form, &t.labels, "label", &number)?,
         (Act::Assignees, Some(Item::Ticket(t))) => {
@@ -1303,6 +1380,7 @@ pub fn submit(form: &Form) -> std::result::Result<Cmd, String> {
         label: form.title.clone(),
         args: list,
         stdin,
+        guard,
     })
 }
 
@@ -1542,5 +1620,30 @@ mod tests {
         assert_eq!(cmd.args, ["pr", "ready", "7", "-R", "o/r"]);
         t.state = "CLOSED".into();
         assert_eq!(simple(Act::Ready, &Item::Ticket(t)), None);
+    }
+
+    #[test]
+    fn text_edits_are_guarded() {
+        let Item::Ticket(mut t) = ticket("x") else {
+            unreachable!()
+        };
+        t.title = "old".into();
+        t.body = "a\r\nb".into();
+        let item = Some(Item::Ticket(t));
+        let mut form = Form::new(Tab::Prs, Act::Title, "o/r", item.clone(), "").unwrap();
+        assert_eq!(submit(&form), Err("nothing changed".into()));
+        set(&mut form, 0, " ");
+        assert!(submit(&form).is_err());
+        set(&mut form, 0, "--new");
+        let cmd = submit(&form).unwrap();
+        assert_eq!(cmd.args[3..], ["--repo=o/r", "--title=--new"]);
+        assert_eq!(cmd.guard.unwrap().expected, "old");
+
+        let mut form = Form::new(Tab::Prs, Act::Description, "o/r", item, "").unwrap();
+        assert_eq!(submit(&form), Err("nothing changed".into()));
+        set(&mut form, 0, "a\nc");
+        let cmd = submit(&form).unwrap();
+        assert_eq!(cmd.stdin.as_deref(), Some("a\nc"));
+        assert_eq!(cmd.guard.unwrap().expected, "a\r\nb");
     }
 }

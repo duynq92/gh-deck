@@ -72,7 +72,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let screen = frame.area();
     let rows = flow(app, screen.width, 2);
     // Boxes when they leave enough room for content, one-line groups otherwise.
-    let boxed = rows.len() as u16 * 3 <= screen.height / 5;
+    let boxed = rows.len() as u16 * 3 <= screen.height / 4;
     let rows = if boxed {
         rows
     } else {
@@ -639,6 +639,7 @@ fn group_color(group: &Group) -> Color {
         "View" => Color::Blue,
         "Review" | "Edit" | "Run" => Color::Green,
         "Manage" => Color::Magenta,
+        "My PR" => Color::Yellow,
         "Teams" => Color::Cyan,
         _ => Color::Gray,
     }
@@ -721,7 +722,7 @@ fn key_spans(app: &App, group: &Group) -> Vec<Span<'static>> {
             Act::Merge | Act::Toggle | Act::Delete | Act::Cancel | Act::Publish
         );
         let off = app.list().selected().is_some_and(|item| match k.act {
-            Act::Reviewers => !app.is_mine(item),
+            Act::Reviewers | Act::Title | Act::Description | Act::Tasks => !app.is_mine(item),
             Act::Ready => !app.is_mine(item) || item.state() != "draft",
             _ => false,
         });
@@ -926,7 +927,12 @@ fn draw_form(frame: &mut Frame, form: &Form) {
             ("Tab", "Next field"),
             ("Esc", "Cancel"),
         ]));
-    let inner = popup(frame, 84, wanted + 3, block);
+    // Descriptions are long: use most of the screen.
+    let (width, wanted) = match form.act {
+        Act::Description => (120, 40),
+        _ => (84, wanted),
+    };
+    let inner = popup(frame, width, wanted + 3, block);
     let areas = Layout::vertical(heights).split(inner);
     for (i, field) in form.fields.iter().enumerate() {
         let (area, focused) = (areas[i], i == form.focus);

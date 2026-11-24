@@ -37,6 +37,30 @@ pub struct Cmd {
     pub label: String,
     pub args: Vec<String>,
     pub stdin: Option<String>,
+    pub guard: Option<Guard>,
+}
+
+/// Text that must still be on GitHub, so an edit never overwrites a newer one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Guard {
+    /// Prints the current text as a JSON string.
+    pub args: Vec<String>,
+    pub expected: String,
+}
+
+/// Run a mutating command once its guard, if any, holds.
+pub fn execute(cmd: &Cmd) -> Result<String> {
+    if let Some(guard) = &cmd.guard {
+        let now: String = serde_json::from_str(&run(&guard.args, None, JSON)?)
+            .map_err(|e| GhError(format!("unexpected gh response: {e}")))?;
+        if now != guard.expected {
+            return Err(GhError(
+                "changed on GitHub meanwhile; nothing was saved. Copy your text and open it again"
+                    .into(),
+            ));
+        }
+    }
+    run(&cmd.args, cmd.stdin.as_deref(), JSON)
 }
 
 pub fn run(args: &[String], stdin: Option<&str>, keep: Keep) -> Result<String> {
