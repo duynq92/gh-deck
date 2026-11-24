@@ -1,6 +1,6 @@
 //! Application state and key handling.
 
-use crate::api::{self, Item, Page, Query, Repos};
+use crate::api::{self, Detail, Item, Page, Query, Repos, Reviews};
 use crate::doc::Doc;
 use crate::form::{self, Form};
 use crate::gh::{self, Cmd, GhError, Result};
@@ -13,6 +13,8 @@ use std::thread;
 pub enum Msg {
     Input(std::io::Result<Event>),
     Repos(Result<(Repos, Option<String>)>),
+    Teams(Result<Vec<String>>),
+    Reviews(Result<Vec<Reviews>>),
     List {
         tab: Tab,
         job: u64,
@@ -21,9 +23,8 @@ pub enum Msg {
     },
     Doc {
         job: u64,
-        diff: bool,
         bottom: bool,
-        result: Result<String>,
+        result: Result<Detail>,
     },
     Workflows {
         job: u64,
@@ -49,7 +50,8 @@ pub struct List {
     pub cursor: Option<String>,
     pub loading: bool,
     pub loaded: bool,
-    pub filter: usize,
+    /// Name and value of the chosen filter; `None` is everything.
+    pub filter: Option<(String, String)>,
     pub state: usize,
     pub find: String,
     job: u64,
@@ -71,7 +73,9 @@ impl List {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pick {
+    Org,
     Scope,
+    Filter,
     Target(Act),
     Workflow(String),
 }
@@ -111,6 +115,9 @@ pub struct App {
     tx: Sender<Msg>,
     pub tab: Tab,
     pub lists: [List; 4],
+    /// Chosen organization (or the user).
+    pub org: Option<String>,
+    /// Chosen repository.
     pub scope: Option<String>,
     pub repos: Option<Repos>,
     pub modal: Option<Modal>,
@@ -137,6 +144,7 @@ impl App {
             tx,
             tab: Tab::Prs,
             lists: Default::default(),
+            org: None,
             scope,
             repos: None,
             modal: None,
@@ -193,7 +201,7 @@ impl App {
     }
 
     fn load(&mut self, tab: Tab, append: bool) {
-        let scope = self.scope.clone();
+        let (org, scope) = (self.org.clone(), self.scope.clone());
         let repos = match (&self.repos, &scope) {
             (Some(r), _) => r.clone(),
             (None, Some(_)) => Repos::default(),
@@ -209,8 +217,9 @@ impl App {
         let job = list.job;
         let query = Query {
             tab,
+            org,
             scope,
-            filter: list.filter,
+            filter: list.filter.clone().unwrap_or_default().1,
             state: list.state,
             cursor: list.cursor.clone().filter(|_| append),
         };
@@ -250,7 +259,7 @@ impl App {
             .selected()
             .map(Item::preview)
             .unwrap_or_default();
-        self.doc = Doc::new(&text, false);
+        self.doc = Doc::plain(&text);
         self.doc_act = Act::Info;
         self.doc_id = id;
     }
@@ -268,11 +277,10 @@ impl App {
         } else {
             String::new()
         };
-        self.doc = Doc::new(&text, false);
+        self.doc = Doc::plain(&text);
         let job = self.doc_job;
         self.spawn(move || Msg::Doc {
             job,
-            diff: act == Act::Diff,
             bottom: matches!(act, Act::Log | Act::FailedLog),
             result: api::detail(act, &item),
         });
@@ -319,10 +327,23 @@ impl App {
                         }
                     }
                 }
+                if first {
+                    let login = self.repos.as_ref().map(|r| r.login.clone());
+                    let login = login.unwrap_or_default();
+                    self.spawn(move || Msg::Teams(api::teams(&login)));
+                }
                 if cursor.is_some() && wanted {
                     self.load_repos(cursor);
                 }
             }
+            Msg::Teams(Ok(teams)) => {
+                if let Some(repos) = &mut self.repos {
+                    repos.teams = teams;
+                }
+            }
+            Msg::Teams(Err(e)) => self.error(format!("cannot list your teams: {e}")),
+            Msg::Reviews(Ok(reviews)) => self.reviewed(reviews),
+            Msg::Reviews(Err(e)) => self.error(format!("cannot load reviews: {e}")),
             Msg::Repos(Err(e)) => {
                 if self.repos.is_none() && self.scope.is_none() {
                     for list in &mut self.lists {
@@ -339,15 +360,14 @@ impl App {
             } => self.listed(tab, job, append, result),
             Msg::Doc {
                 job,
-                diff,
                 bottom,
                 result,
             } if job == self.doc_job => {
                 self.doc_loading = false;
                 match result {
-                    Ok(text) => {
+                    Ok(d) => {
                         let top = self.doc.top;
-                        self.doc = Doc::new(&text, diff);
+                        self.doc = Doc::new(&d.head, &d.body, d.diff.as_deref(), &d.tail);
                         // Logs are read from the end; rendering clamps this.
                         self.doc.top = if bottom { usize::MAX } else { top };
                     }
@@ -370,6 +390,7 @@ impl App {
                         self.picker(
                             format!("Trigger workflow in {repo}"),
                             items,
+                            0,
                             Pick::Workflow(repo),
                         );
                     }
@@ -414,10 +435,24 @@ impl App {
         match result {
             Ok(page) => {
                 let keep = list.selected().map(Item::id);
+                let mut items = page.items;
+                let mut ids = Vec::new();
+                for item in &mut items {
+                    if let Item::Ticket(t) = item
+                        && !t.id.is_empty()
+                    {
+                        // Show the previous reviews until the new ones arrive.
+                        t.reviews = list.items.iter().find_map(|i| match i {
+                            Item::Ticket(old) if old.id == t.id => old.reviews.clone(),
+                            _ => None,
+                        });
+                        ids.push(t.id.clone());
+                    }
+                }
                 if append {
-                    list.items.extend(page.items);
+                    list.items.extend(items);
                 } else {
-                    list.items = page.items;
+                    list.items = items;
                 }
                 list.loaded = true;
                 list.total = page.total;
@@ -431,11 +466,38 @@ impl App {
                 if tab == self.tab {
                     self.sync_doc();
                 }
+                if !ids.is_empty() {
+                    self.spawn(move || Msg::Reviews(api::reviews(&ids)));
+                }
                 if let Some(w) = page.warning {
                     self.error(w);
                 }
             }
             Err(e) => self.error(format!("{}: {e}", tab.title())),
+        }
+    }
+
+    fn reviewed(&mut self, reviews: Vec<Reviews>) {
+        let list = &mut self.lists[Tab::Prs as usize];
+        for review in reviews {
+            for item in &mut list.items {
+                if let Item::Ticket(t) = item
+                    && t.id == review.id
+                {
+                    t.reviews = Some(review);
+                    break;
+                }
+            }
+        }
+        let keep = list.selected().map(Item::id);
+        list.refilter(); // reviewers are searchable
+        if let Some(pos) =
+            keep.and_then(|id| list.view.iter().position(|&i| list.items[i].id() == id))
+        {
+            list.sel = pos;
+        }
+        if self.tab == Tab::Prs {
+            self.sync_doc();
         }
     }
 
@@ -576,17 +638,26 @@ impl App {
                 self.detail_focus = false;
                 self.finding = true;
             }
+            Act::Org => self.pick_org(),
             Act::Filter => {
-                let count = api::filters(self.tab).len();
-                let (tab, scoped) = (self.tab, self.scope.is_some());
-                let ticket = matches!(tab, Tab::Prs | Tab::Issues);
-                if count > 1 && (ticket || !scoped) {
-                    let list = self.list_mut();
-                    list.filter = (list.filter + 1) % count;
-                    if scoped && api::filters(tab)[list.filter].1 == api::MINE {
-                        list.filter = (list.filter + 1) % count;
-                    }
-                    self.reset();
+                let teams = self.repos.as_ref().map_or(&[][..], |r| &r.teams);
+                let items = api::filters(self.tab, teams);
+                let current = self.list().filter.as_ref();
+                let sel = items
+                    .iter()
+                    .position(|i| Some(i) == current)
+                    .unwrap_or_default();
+                if !items.is_empty() {
+                    self.picker("Filter".into(), items, sel, Pick::Filter);
+                }
+            }
+            Act::NextFile | Act::PrevFile => {
+                if self.doc.has_files() {
+                    self.detail_focus = true;
+                    let height = self.doc_height;
+                    self.doc.jump(act == Act::NextFile, height);
+                } else if !self.doc_loading {
+                    self.open_doc(Act::Diff);
                 }
             }
             Act::State => {
@@ -690,25 +761,44 @@ impl App {
         };
         let mut items: Vec<(String, String)> = Vec::with_capacity(repos.names.len() + 1);
         if pick == Pick::Scope {
-            items.push(("All repositories".into(), String::new()));
+            items.push(("All".into(), String::new()));
         } else if let Some(item) = self.list().selected() {
             // The selected item's repository is the likely target.
             items.push((item.repo().into(), item.repo().into()));
         }
+        let org = self.org.as_deref();
         for name in &repos.names {
+            if org.is_some() && name.split('/').next() != org {
+                continue;
+            }
             if !items.iter().any(|i| &i.1 == name) {
                 items.push((name.clone(), name.clone()));
             }
         }
-        self.picker(title.into(), items, pick);
+        self.picker(title.into(), items, 0, pick);
     }
 
-    fn picker(&mut self, title: String, items: Vec<(String, String)>, pick: Pick) {
+    fn pick_org(&mut self) {
+        let Some(repos) = &self.repos else {
+            self.error("the organization list is not loaded yet; press R to retry");
+            return;
+        };
+        let mut items = vec![("All".to_string(), String::new())];
+        items.extend(repos.orgs.iter().map(|o| (o.clone(), o.clone())));
+        items.push((format!("{} (personal)", repos.login), repos.login.clone()));
+        let sel = items
+            .iter()
+            .position(|i| Some(&i.1) == self.org.as_ref())
+            .unwrap_or_default();
+        self.picker("Show organization".into(), items, sel, Pick::Org);
+    }
+
+    fn picker(&mut self, title: String, items: Vec<(String, String)>, sel: usize, pick: Pick) {
         self.modal = Some(Modal::Picker(Picker {
             title,
             items,
             find: String::new(),
-            sel: 0,
+            sel,
             pick,
         }));
     }
@@ -762,18 +852,36 @@ impl App {
         }
     }
 
+    /// Organization or repository changed: every tab loads again when shown.
+    fn clear_lists(&mut self) {
+        for list in &mut self.lists {
+            *list = List {
+                filter: list.filter.take(),
+                state: list.state,
+                job: list.job + 1, // ignore lists still in flight
+                ..List::default()
+            };
+        }
+        self.reset();
+    }
+
     fn picked(&mut self, pick: Pick, value: String) {
         match pick {
+            Pick::Org => {
+                self.org = Some(value).filter(|v| !v.is_empty());
+                self.scope = None;
+                self.clear_lists();
+            }
             Pick::Scope => {
                 self.scope = Some(value).filter(|v| !v.is_empty());
-                for list in &mut self.lists {
-                    *list = List {
-                        filter: list.filter,
-                        state: list.state,
-                        job: list.job + 1, // ignore lists still in flight
-                        ..List::default()
-                    };
-                }
+                self.clear_lists();
+            }
+            Pick::Filter => {
+                let teams = self.repos.as_ref().map_or(&[][..], |r| &r.teams);
+                let chosen = api::filters(self.tab, teams)
+                    .into_iter()
+                    .find(|f| f.1 == value && !value.is_empty());
+                self.list_mut().filter = chosen;
                 self.reset();
             }
             Pick::Target(act) => self.target(act, value),

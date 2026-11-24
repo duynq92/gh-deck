@@ -12,6 +12,14 @@ pub enum Tab {
 impl Tab {
     pub const ALL: [Tab; 4] = [Tab::Prs, Tab::Issues, Tab::Releases, Tab::Runs];
 
+    pub fn short(self) -> &'static str {
+        if self == Tab::Prs {
+            "PRs"
+        } else {
+            self.title()
+        }
+    }
+
     pub fn title(self) -> &'static str {
         match self {
             Tab::Prs => "Pull Requests",
@@ -25,6 +33,7 @@ impl Tab {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Act {
     // Global
+    Org,
     Repo,
     Filter,
     State,
@@ -37,6 +46,8 @@ pub enum Act {
     Info,
     Web,
     Diff,
+    NextFile,
+    PrevFile,
     Checks,
     Approve,
     RequestChanges,
@@ -74,12 +85,20 @@ const fn k(key: char, label: &'static str, act: Act) -> Key {
     Key { key, label, act }
 }
 
-pub const GLOBAL: Group = Group {
-    name: "General",
+/// Shown in the top-right corner together with their current value.
+pub const SCOPE: Group = Group {
+    name: "Show",
     keys: &[
+        k('o', "Org", Act::Org),
         k('p', "Repo", Act::Repo),
         k('f', "Filter", Act::Filter),
         k('s', "State", Act::State),
+    ],
+};
+
+pub const GLOBAL: Group = Group {
+    name: "General",
+    keys: &[
         k('/', "Find", Act::Find),
         k('>', "More", Act::More),
         k('R', "Refresh", Act::Refresh),
@@ -94,6 +113,8 @@ const PRS: &[Group] = &[
         keys: &[
             k('i', "Info", Act::Info),
             k('d', "Diff", Act::Diff),
+            k('n', "Next file", Act::NextFile),
+            k('N', "Prev file", Act::PrevFile),
             k('h', "Checks", Act::Checks),
             k('w', "Web", Act::Web),
         ],
@@ -189,7 +210,7 @@ pub fn groups(tab: Tab) -> &'static [Group] {
 pub fn lookup(tab: Tab, key: char) -> Option<Act> {
     groups(tab)
         .iter()
-        .chain([&GLOBAL])
+        .chain([&SCOPE, &GLOBAL])
         .flat_map(|g| g.keys)
         .find(|k| k.key == key)
         .map(|k| k.act)
@@ -204,7 +225,11 @@ mod tests {
     fn shortcuts_never_collide() {
         for tab in Tab::ALL {
             let mut seen: HashSet<char> = "1234jkgG".chars().collect();
-            for key in groups(tab).iter().chain([&GLOBAL]).flat_map(|g| g.keys) {
+            for key in groups(tab)
+                .iter()
+                .chain([&SCOPE, &GLOBAL])
+                .flat_map(|g| g.keys)
+            {
                 assert!(seen.insert(key.key), "{tab:?}: duplicate {:?}", key.key);
             }
         }

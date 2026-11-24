@@ -16,11 +16,14 @@ const PARALLEL: usize = 4;
 const ALL_REPOS: &str = "OWNER,COLLABORATOR,ORGANIZATION_MEMBER";
 /// Repositories to list at most.
 pub const MAX_REPOS: usize = 500;
-/// Filter value for repositories owned by the user, not their organizations.
-pub const MINE: &str = "OWNER";
+/// Filter value: review requested from any team the user belongs to.
+pub const MY_TEAMS: &str = "my-teams";
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Ticket {
+    /// GraphQL node id, used to load reviews.
+    #[serde(default)]
+    pub id: String,
     pub repo: String,
     pub number: u64,
     pub title: String,
@@ -40,7 +43,52 @@ pub struct Ticket {
     pub base: String,
     #[serde(default)]
     pub oid: String,
+    /// Loaded after the list, because GitHub is slow to compute it.
+    #[serde(skip)]
+    pub reviews: Option<Reviews>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Reviews {
+    pub id: String,
+    pub decision: Option<String>,
     pub checks: Option<String>,
+    pub reviewers: Vec<Reviewer>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Reviewer {
+    pub name: String,
+    /// `REQUESTED` or the state of the latest review.
+    pub state: String,
+}
+
+impl Reviewer {
+    pub fn mark(&self) -> char {
+        match self.state.as_str() {
+            "APPROVED" => '✓',
+            "CHANGES_REQUESTED" => '✗',
+            "REQUESTED" => '●',
+            "DISMISSED" => '-',
+            _ => '·',
+        }
+    }
+}
+
+impl Reviews {
+    pub fn approval(&self) -> &'static str {
+        let any = |state| self.reviewers.iter().any(|r| r.state == state);
+        match self.decision.as_deref() {
+            Some("APPROVED") => "✓ approved",
+            Some("CHANGES_REQUESTED") => "✗ changes",
+            Some(_) => "● required",
+            // Without branch protection GitHub decides nothing.
+            None if any("CHANGES_REQUESTED") => "✗ changes",
+            None if any("APPROVED") => "✓ approved",
+            None if any("REQUESTED") => "● pending",
+            None => "· none",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -145,15 +193,24 @@ impl Item {
             Item::Release(r) => r.author.as_deref(),
             Item::Run(r) => r.name.as_deref(),
         };
-        format!(
-            "{} {} {} {}",
-            self.id(),
-            self.title(),
-            self.state(),
-            author.unwrap_or("")
-        )
-        .to_lowercase()
-        .contains(needle)
+        let reviews = match self {
+            Item::Ticket(t) => t.reviews.as_ref(),
+            _ => None,
+        };
+        let reviewer = reviews
+            .iter()
+            .flat_map(|r| &r.reviewers)
+            .any(|r| r.name.to_lowercase().contains(needle));
+        reviewer
+            || format!(
+                "{} {} {} {}",
+                self.id(),
+                self.title(),
+                self.state(),
+                author.unwrap_or("")
+            )
+            .to_lowercase()
+            .contains(needle)
     }
 
     /// Instant preview, built from data the list already holds.
@@ -172,8 +229,31 @@ impl Item {
                 if !t.head.is_empty() {
                     s += &format!("{} ← {}\n", t.base, t.head);
                 }
-                if let Some(v) = &t.checks {
-                    s += &format!("Checks: {}\n", v.to_lowercase().replace('_', " "));
+                if let Some(r) = &t.reviews {
+                    s += &format!(
+                        "Approval: {}
+",
+                        r.approval()
+                    );
+                    if let Some(c) = &r.checks {
+                        s += &format!(
+                            "Checks: {}
+",
+                            c.to_lowercase()
+                        );
+                    }
+                    let names: Vec<String> = r
+                        .reviewers
+                        .iter()
+                        .map(|r| format!("{} {}", r.mark(), r.name))
+                        .collect();
+                    if !names.is_empty() {
+                        s += &format!(
+                            "Reviewers: {}
+",
+                            names.join(", ")
+                        );
+                    }
                 }
                 for (name, list) in [("Labels", &t.labels), ("Assignees", &t.assignees)] {
                     if !list.is_empty() {
@@ -220,6 +300,9 @@ pub fn date(iso: &str) -> String {
 pub struct Repos {
     pub login: String,
     pub orgs: Vec<String>,
+    /// `org/team` of every team the user is in; loaded separately.
+    #[serde(default)]
+    pub teams: Vec<String>,
     /// Most recently pushed first.
     pub names: Vec<String>,
 }
@@ -236,29 +319,42 @@ pub struct Page {
 #[derive(Debug, Clone)]
 pub struct Query {
     pub tab: Tab,
+    /// An organization or the user.
+    pub org: Option<String>,
     pub scope: Option<String>,
-    pub filter: usize,
+    /// A search qualifier or `MY_TEAMS`.
+    pub filter: String,
     pub state: usize,
     pub cursor: Option<String>,
 }
 
-pub fn filters(tab: Tab) -> &'static [(&'static str, &'static str)] {
+/// Filter names and values. Empty when the tab has no filters.
+pub fn filters(tab: Tab, teams: &[String]) -> Vec<(String, String)> {
+    let item = |name: &str, value: &str| (name.to_string(), value.to_string());
     match tab {
-        Tab::Prs => &[
-            ("All repos", ""),
-            ("My repos", MINE),
-            ("Involves me", "involves:@me"),
-            ("Created by me", "author:@me"),
-            ("Review requested", "review-requested:@me"),
+        Tab::Prs => {
+            let mut all = vec![
+                item("All", ""),
+                item("Opened by me", "author:@me"),
+                item("Review requested: me", "user-review-requested:@me"),
+            ];
+            if !teams.is_empty() {
+                all.push(item("Review requested: my teams", MY_TEAMS));
+            }
+            all.push(item("Involves me", "involves:@me"));
+            for team in teams {
+                let value = format!("team-review-requested:{team}");
+                all.push((format!("Review requested: {team}"), value));
+            }
+            all
+        }
+        Tab::Issues => vec![
+            item("All", ""),
+            item("Opened by me", "author:@me"),
+            item("Assigned to me", "assignee:@me"),
+            item("Involves me", "involves:@me"),
         ],
-        Tab::Issues => &[
-            ("All repos", ""),
-            ("My repos", MINE),
-            ("Involves me", "involves:@me"),
-            ("Created by me", "author:@me"),
-            ("Assigned to me", "assignee:@me"),
-        ],
-        Tab::Releases | Tab::Runs => &[("All repos", ""), ("My repos", MINE)],
+        Tab::Releases | Tab::Runs => Vec::new(),
     }
 }
 
@@ -328,6 +424,47 @@ pub fn repos(after: Option<&str>) -> Result<(Repos, Option<String>)> {
     Ok((out.repos, out.cursor))
 }
 
+/// Every team the user belongs to.
+pub fn teams(login: &str) -> Result<Vec<String>> {
+    fetch(&[
+        "api",
+        "graphql",
+        "-f",
+        "query=query($login:String!){viewer{organizations(first:100){nodes{\
+         teams(first:100,userLogins:[$login]){nodes{combinedSlug}}}}}}",
+        "-f",
+        &format!("login={login}"),
+        "--jq",
+        "[.data.viewer.organizations.nodes[].teams.nodes[].combinedSlug]",
+    ])
+}
+
+/// Review state of the given pull requests.
+pub fn reviews(ids: &[String]) -> Result<Vec<Reviews>> {
+    let ids: Vec<String> = ids.iter().map(|id| format!("ids[]={id}")).collect();
+    let mut list = vec!["api", "graphql"];
+    for id in &ids {
+        list.extend(["-f", id]);
+    }
+    list.extend([
+        "-f",
+        "query=query($ids:[ID!]!){nodes(ids:$ids){...on PullRequest{id author{login} \
+         reviewDecision reviewRequests(first:20){nodes{requestedReviewer{\
+         ...on User{login} ...on Bot{login} ...on Mannequin{login} ...on Team{slug}}}} \
+         latestReviews(first:20){nodes{state author{login}}} \
+         commits(last:1){nodes{commit{statusCheckRollup{state}}}}}}}",
+        "--jq",
+        "[.data.nodes[]|select(.id)|.author.login as $me\
+         |([.reviewRequests.nodes[].requestedReviewer|select(.)\
+         |{name:(.login//(\"@\"+.slug)),state:\"REQUESTED\"}]) as $asked\
+         |{id,decision:.reviewDecision,checks:.commits.nodes[0].commit.statusCheckRollup.state,\
+         reviewers:([.latestReviews.nodes[]|select(.author and .author.login!=$me)\
+         |{name:.author.login,state}\
+         |select(.name as $n|$asked|any(.name==$n)|not)]+$asked)}]",
+    ]);
+    fetch(&list)
+}
+
 pub fn list(q: &Query, repos: &Repos) -> Result<Page> {
     match q.tab {
         Tab::Prs | Tab::Issues => tickets(q, repos),
@@ -336,37 +473,45 @@ pub fn list(q: &Query, repos: &Repos) -> Result<Page> {
     }
 }
 
-fn search_query(q: &Query, repos: &Repos) -> String {
+/// Search type and query.
+fn search_query(q: &Query, repos: &Repos) -> (&'static str, String) {
     let kind = if q.tab == Tab::Prs {
         "is:pr"
     } else {
         "is:issue"
     };
-    let filter = filters(q.tab)[q.filter].1;
-    let place = match (&q.scope, filter) {
+    let place = match (&q.scope, &q.org) {
         (Some(repo), _) => format!("repo:{repo}"),
-        (None, MINE) => format!("user:{}", repos.login),
-        (None, "") => repos
+        (None, Some(org)) => format!("user:{org}"),
+        (None, None) if q.filter.is_empty() => repos
             .orgs
             .iter()
             .fold(format!("user:{}", repos.login), |all, org| {
                 all + " org:" + org
             }),
-        (None, _) => String::new(),
+        // "Mine" filters are not limited to known repositories.
+        (None, None) => String::new(),
     };
-    let filter = if filter == MINE { "" } else { filter };
-    [
+    // Only the advanced search understands OR.
+    let (search, filter) = if q.filter == MY_TEAMS {
+        let teams: Vec<String> = repos
+            .teams
+            .iter()
+            .map(|t| format!("team-review-requested:{t}"))
+            .collect();
+        ("ISSUE_ADVANCED", format!("({})", teams.join(" OR ")))
+    } else {
+        ("ISSUE", q.filter.clone())
+    };
+    let parts = [
         kind,
         &place,
-        filter,
+        &filter,
         states(q.tab)[q.state].1,
         "archived:false sort:updated-desc",
-    ]
-    .iter()
-    .filter(|s| !s.is_empty())
-    .copied()
-    .collect::<Vec<_>>()
-    .join(" ")
+    ];
+    let parts: Vec<&str> = parts.into_iter().filter(|s| !s.is_empty()).collect();
+    (search, parts.join(" "))
 }
 
 const TICKET: &str = "number title state updatedAt url body author{login} \
@@ -380,18 +525,16 @@ fn tickets(q: &Query, repos: &Repos) -> Result<Page> {
         items: Vec<Ticket>,
     }
     let kind = if q.tab == Tab::Prs {
-        format!(
-            "... on PullRequest{{{TICKET} isDraft headRefName headRefOid baseRefName \
-             commits(last:1){{nodes{{commit{{statusCheckRollup{{state}}}}}}}}}}"
-        )
+        format!("... on PullRequest{{{TICKET} id isDraft headRefName headRefOid baseRefName}}")
     } else {
         format!("... on Issue{{{TICKET}}}")
     };
+    let (search_type, search) = search_query(q, repos);
     let query = format!(
-        "query=query($q:String!,$after:String){{search(type:ISSUE,first:{SEARCH_PAGE},query:$q,\
+        "query=query($q:String!,$after:String){{search(type:{search_type},first:{SEARCH_PAGE},query:$q,\
          after:$after){{issueCount pageInfo{{hasNextPage endCursor}} nodes{{{kind}}}}}}}"
     );
-    let search = format!("q={}", search_query(q, repos));
+    let search = format!("q={search}");
     let after = q.cursor.as_ref().map(|c| format!("after={c}"));
     let mut list = vec!["api", "graphql", "-f", &query, "-f", &search];
     if let Some(after) = &after {
@@ -404,7 +547,7 @@ fn tickets(q: &Query, repos: &Repos) -> Result<Page> {
          items:[.nodes[]|select(.number)|{repo:.repository.nameWithOwner,number,title,state,\
          updated:.updatedAt,url,body,author:.author.login,labels:[.labels.nodes[].name],\
          assignees:[.assignees.nodes[].login],draft:(.isDraft//false),head:(.headRefName//\"\"),\
-         oid:(.headRefOid//\"\"),base:(.baseRefName//\"\"),checks:.commits.nodes[0].commit.statusCheckRollup.state}]}",
+         oid:(.headRefOid//\"\"),base:(.baseRefName//\"\"),id:(.id//\"\")}]}",
     ]);
     let out: Out = fetch(&list)?;
     // The search index lags behind changes; trust the live state instead.
@@ -453,22 +596,27 @@ fn releases(q: &Query) -> Result<Page> {
             ])?
         }
         None => {
-            let who = match filters(q.tab)[q.filter].1 {
-                MINE => MINE,
-                _ => ALL_REPOS,
+            // `viewer` spans everything; an owner narrows to its repositories.
+            let (root, mine) = match &q.org {
+                Some(org) => (format!("repositoryOwner(login:\"{org}\")"), "OWNER"),
+                None => ("viewer".into(), ALL_REPOS),
+            };
+            let affiliations = match q.org {
+                Some(_) => String::new(),
+                None => format!("affiliations:[{ALL_REPOS}],"),
             };
             fetch(&[
                 "api",
                 "graphql",
                 "-f",
                 &format!(
-                    "query={{viewer{{repositories(first:50,affiliations:[{who}],\
-                     ownerAffiliations:[{who}],\
+                    "query={{o:{root}{{repositories(first:50,{affiliations}\
+                     ownerAffiliations:[{mine}],\
                      orderBy:{{field:PUSHED_AT,direction:DESC}}){{nodes{{{}}}}}}}}}",
                     fields(3)
                 ),
                 "--jq",
-                &format!(".data.viewer.repositories.nodes|{map}"),
+                &format!(".data.o.repositories.nodes|{map}"),
             ])?
         }
     };
@@ -507,10 +655,7 @@ fn runs(q: &Query, repos: &Repos) -> Result<Page> {
         None => repos
             .names
             .iter()
-            .filter(|n| {
-                filters(q.tab)[q.filter].1 != MINE
-                    || n.split('/').next() == Some(repos.login.as_str())
-            })
+            .filter(|n| q.org.is_none() || n.split('/').next() == q.org.as_deref())
             .take(RUN_REPOS)
             .map(String::as_str)
             .collect(),
@@ -566,8 +711,55 @@ pub fn workflows(repo: &str) -> Result<Vec<(String, String)>> {
         .collect())
 }
 
-/// Load a detail document. Returns its text.
-pub fn detail(act: Act, item: &Item) -> Result<String> {
+/// A loaded detail document.
+#[derive(Debug, Default)]
+pub struct Detail {
+    pub head: String,
+    pub body: String,
+    pub tail: String,
+    pub diff: Option<String>,
+}
+
+/// Load a detail document.
+pub fn detail(act: Act, item: &Item) -> Result<Detail> {
+    let is_pr = matches!(item, Item::Ticket(t) if !t.head.is_empty());
+    match act {
+        Act::Diff => Ok(Detail {
+            diff: Some(text(act, item)?),
+            ..Detail::default()
+        }),
+        Act::Info if is_pr => {
+            let (talk, diff) = thread::scope(|s| {
+                let diff = s.spawn(|| text(Act::Diff, item));
+                let talk = text(act, item);
+                let diff = diff
+                    .join()
+                    .unwrap_or_else(|_| Err(GhError("worker panicked".into())));
+                (talk, diff)
+            });
+            let tail = format!("── Conversation\n{}", talk?);
+            let preview = item.preview();
+            let (head, body) = preview.split_once("\n\n").unwrap_or((&preview, ""));
+            let mut body = format!("── Description\n{body}");
+            // GitHub refuses very large diffs; the rest is still useful.
+            let diff = diff
+                .map_err(|e| body = format!("── Changes not available: {e}\n\n{body}"))
+                .ok();
+            Ok(Detail {
+                head: head.to_string(),
+                body,
+                tail,
+                diff,
+            })
+        }
+        _ => Ok(Detail {
+            head: text(act, item)?,
+            ..Detail::default()
+        }),
+    }
+}
+
+fn text(act: Act, item: &Item) -> Result<String> {
     let repo = item.repo();
     let get = |list: &[&str], keep: Keep| gh::run(&args(list), None, keep);
     match (act, item) {
@@ -600,7 +792,11 @@ pub fn detail(act: Act, item: &Item) -> Result<String> {
             } else {
                 &thread
             };
-            Ok(format!("{}\n\n{thread}", item.preview()))
+            Ok(if t.head.is_empty() {
+                format!("{}\n\n{thread}", item.preview())
+            } else {
+                thread.to_string()
+            })
         }
         (Act::Info, Item::Release(r)) => {
             let flag = format!("--repo={repo}");
@@ -987,30 +1183,63 @@ mod tests {
     fn builds_search_queries() {
         let mut q = Query {
             tab: Tab::Prs,
+            org: None,
             scope: None,
-            filter: 0,
+            filter: String::new(),
             state: 0,
             cursor: None,
         };
         let repos = Repos {
             login: "me".into(),
             orgs: vec!["a".into(), "b".into()],
+            teams: vec!["a/x".into(), "b/y".into()],
             names: vec![],
         };
         let tail = "archived:false sort:updated-desc";
-        let check = |q: &Query, want: &str| {
-            assert_eq!(search_query(q, &repos), format!("is:pr {want} {tail}"));
+        let check = |q: &Query, kind: &str, want: &str| {
+            let want = format!("is:pr {want} {tail}");
+            assert_eq!(search_query(q, &repos), (kind, want));
         };
-        check(&q, "user:me org:a org:b is:open");
-        q.filter = 1;
-        check(&q, "user:me is:open");
-        q.filter = 2;
-        check(&q, "involves:@me is:open");
+        check(&q, "ISSUE", "user:me org:a org:b is:open");
+        q.filter = "author:@me".into();
+        check(&q, "ISSUE", "author:@me is:open");
+        q.org = Some("a".into());
+        check(&q, "ISSUE", "user:a author:@me is:open");
+        q.filter = MY_TEAMS.into();
+        check(
+            &q,
+            "ISSUE_ADVANCED",
+            "user:a (team-review-requested:a/x OR team-review-requested:b/y) is:open",
+        );
         q.scope = Some("o/r".into());
-        check(&q, "repo:o/r involves:@me is:open");
-        q.filter = 1;
+        q.filter.clear();
         q.state = 3;
-        check(&q, "repo:o/r");
+        check(&q, "ISSUE", "repo:o/r");
+    }
+
+    #[test]
+    fn approval_follows_decision_then_reviews() {
+        let reviews = |decision: Option<&str>, states: &[&str]| Reviews {
+            decision: decision.map(String::from),
+            reviewers: states
+                .iter()
+                .map(|s| Reviewer {
+                    name: "x".into(),
+                    state: s.to_string(),
+                })
+                .collect(),
+            ..Reviews::default()
+        };
+        for (decision, states, want) in [
+            (Some("REVIEW_REQUIRED"), &["APPROVED"][..], "● required"),
+            (Some("APPROVED"), &["REQUESTED"], "✓ approved"),
+            (None, &["APPROVED", "CHANGES_REQUESTED"], "✗ changes"),
+            (None, &["APPROVED", "REQUESTED"], "✓ approved"),
+            (None, &["REQUESTED"], "● pending"),
+            (None, &["COMMENTED"], "· none"),
+        ] {
+            assert_eq!(reviews(decision, states).approval(), want);
+        }
     }
 
     #[test]

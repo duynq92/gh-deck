@@ -30,12 +30,16 @@ Press `?` in the app for the current tab's shortcuts.
 
 | Where | Keys |
 |---|---|
-| Everywhere | `1`-`4`/`Tab` tabs, `j`/`k` move, `g`/`G` top/end, `Enter` open, `Esc` back, `p` repo, `f` filter, `s` state, `/` find, `>` more, `R` refresh, `?` help, `q` quit |
-| Pull requests | `i` info, `d` diff, `h` checks, `w` web, `a` approve, `x` request changes, `c` comment, `m` merge, `X` close/reopen, `b` checkout |
+| Everywhere | `1`-`4`/`Tab` tabs, `j`/`k` move, `g`/`G` top/end, `Enter` open, `Esc` back, `o` organization, `p` repo, `f` filter, `s` state, `/` find, `>` more, `R` refresh, `?` help, `q` quit |
+| Pull requests | `i` info, `d` diff, `n`/`N` next/previous file, `h` checks, `w` web, `a` approve, `x` request changes, `c` comment, `m` merge, `X` close/reopen, `b` checkout |
 | Issues | `i` info, `w` web, `n` new, `c` comment, `l` labels, `a` assignees, `X` close/reopen |
 | Releases | `i` info, `w` web, `D` download, `n` new, `e` edit, `P` publish, `X` delete |
 | Actions | `i` jobs, `l` log, `L` failed log, `w` web, `r` rerun all, `F` rerun failed, `x` cancel, `t` trigger workflow |
 | Forms | `Ctrl+S` submit, `Tab` next field, `Esc` cancel |
+
+Reviewer marks: `✓` approved, `✗` changes requested, `●` waiting, `·` commented,
+`-` dismissed. The `f` filters for pull requests are: opened by me, review
+requested from me, from any of my teams, or from one team, and involving me.
 
 Close, delete, publish, rerun and cancel ask for `y` first. Merge and review
 actions open a form that is only sent with `Ctrl+S`.
@@ -54,7 +58,8 @@ actions open a form that is only sent with `Ctrl+S`.
   ones (one request each), 5 runs per repository.
 - The Releases tab without a chosen repository shows the 3 newest releases of the
   50 most recently pushed ones.
-- All tabs include your organizations; `f` narrows to your own repositories.
+- All tabs include your organizations; `o` narrows to one or to your own repositories.
+- Reviewers, approval and checks of pull requests appear a few seconds after the list.
 - The repository picker lists the 500 most recently pushed; use
   `gh deck owner/repo` for others.
 - `b` checkout only works when ghdeck was started inside a clone of that repository.
