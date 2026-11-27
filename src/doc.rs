@@ -111,6 +111,12 @@ pub struct Doc {
     pub anchor: Option<u32>,
     /// First logical line after the code.
     files_end: u32,
+    /// Lines of the "Changed files" summary, one per file.
+    picks: Vec<u32>,
+    /// Chosen row of the summary.
+    pick: usize,
+    /// Only these logical lines are shown: one file, or what comes before them.
+    view: Option<(u32, u32)>,
     rows: Vec<Row>,
     width: u16,
     pub top: usize,
@@ -186,9 +192,6 @@ impl Doc {
             doc.summary(files);
         }
         doc.section(&source.body, rendered);
-        for file in files.iter().flatten() {
-            doc.file(file, source, rendered);
-        }
         let known = |t: &Thread| files.iter().flatten().any(|f| f.path == t.path);
         let mut first = true;
         for (n, thread) in source.threads.iter().enumerate() {
@@ -209,6 +212,9 @@ impl Doc {
                 doc.line("── Discussions on other files", Kind::Heading);
             }
             doc.finding(n, finding, rendered);
+        }
+        for file in files.iter().flatten() {
+            doc.file(file, source, rendered);
         }
         doc.files_end = doc.kinds.len() as u32;
         doc.section(&source.tail, rendered);
@@ -316,6 +322,7 @@ impl Doc {
                 format!("-{}", f.deleted),
                 f.path
             );
+            self.picks.push(self.kinds.len() as u32);
             self.line(&text, Kind::Summary);
         }
     }
@@ -509,6 +516,7 @@ impl Doc {
     fn put(&mut self, line: u32, height: usize) {
         self.cursor = Some(line);
         self.anchor = None;
+        self.focus(line);
         // Near the top, so that the whole text can be read.
         let row = self.rows.partition_point(|r| r.line < line);
         self.top = row.saturating_sub(height / 4);
@@ -532,6 +540,9 @@ impl Doc {
 
     /// Put the cursor on the first line of code that is on screen.
     pub fn start_cursor(&mut self, height: usize) -> bool {
+        if self.listing() {
+            self.open_file(self.pick, height);
+        }
         let top = self.rows.get(self.top).map_or(0, |r| r.line);
         let end = self.kinds.len() as u32;
         let target = |l: &u32| self.is_stop(*l);
@@ -629,6 +640,7 @@ impl Doc {
     /// Scroll just enough to show the cursor with some lines around it.
     fn reveal(&mut self, height: usize) {
         let Some(line) = self.cursor else { return };
+        self.focus(line);
         let row = self.rows.partition_point(|r| r.line < line);
         let margin = (height / 4).min(6);
         if row < self.top + margin {
@@ -698,6 +710,18 @@ impl Doc {
 
     /// Scroll to the next (or previous) file.
     pub fn jump(&mut self, forward: bool, height: usize) {
+        if self.view.is_some() {
+            let now = self.shown_file();
+            let to = match (now, forward) {
+                (None, _) => Some(self.pick),
+                (Some(n), true) => Some(n + 1),
+                (Some(n), false) => n.checked_sub(1),
+            };
+            if let Some(n) = to.filter(|n| *n < self.files.len()) {
+                self.open_file(n, height);
+            }
+            return;
+        }
         let rows = &self.rows;
         let row_of = |line: u32| rows.partition_point(|r| r.line < line);
         let starts = self.files.iter().map(|f| row_of(f.0));
@@ -761,17 +785,35 @@ impl Doc {
         }
     }
 
-    pub fn len(&self) -> usize {
-        self.rows.len()
+    /// Rows shown and how far down they are seen, in percent.
+    pub fn progress(&self, height: usize) -> Option<usize> {
+        let (lo, hi) = self.row_range();
+        let len = hi - lo;
+        (len > height).then(|| ((self.top - lo + height) * 100 / len).min(100))
+    }
+
+    /// Rows of the view.
+    fn row_range(&self) -> (usize, usize) {
+        match self.view {
+            None => (0, self.rows.len()),
+            Some((a, b)) => (
+                self.rows.partition_point(|r| r.line < a),
+                self.rows.partition_point(|r| r.line < b),
+            ),
+        }
     }
 
     pub fn visible(&self, height: usize) -> impl Iterator<Item = Visible<'_>> {
-        self.rows.iter().skip(self.top).take(height).map(|r| {
+        let (_, hi) = self.row_range();
+        let listing = self.listing();
+        let pick = self.picks.get(self.pick).copied();
+        let rows = self.rows[..hi].iter().skip(self.top);
+        rows.take(height).map(move |r| {
             let kind = self.kinds.get(r.line as usize).copied();
             let selected = self.cursor.is_some_and(|c| {
                 let a = self.anchor.unwrap_or(c);
                 (a.min(c)..=a.max(c)).contains(&r.line)
-            });
+            }) || (listing && pick == Some(r.line));
             Visible {
                 selected,
                 indent: if r.continued {
@@ -819,6 +861,9 @@ impl Doc {
 
     /// Show the `n`-th file (from 1) at the top.
     pub fn show_file(&mut self, n: usize, height: usize) {
+        if self.view.is_some() {
+            return self.open_file(n.saturating_sub(1), height);
+        }
         if let Some((line, _)) = self.files.get(n.saturating_sub(1)) {
             self.top = self.rows.partition_point(|r| r.line < *line);
             self.scroll(0, height);
@@ -830,8 +875,111 @@ impl Doc {
     }
 
     pub fn scroll(&mut self, by: isize, height: usize) {
-        let max = self.rows.len().saturating_sub(height);
-        self.top = self.top.saturating_add_signed(by).min(max);
+        let (lo, hi) = self.row_range();
+        let max = hi.saturating_sub(height).max(lo);
+        self.top = self.top.saturating_add_signed(by).clamp(lo, max);
+    }
+
+    /// Show one file at a time, starting with the list of files. A single
+    /// file is shown at once.
+    pub fn one_file_at_a_time(&mut self, height: usize) {
+        let Some(first) = self.files.first().map(|f| f.0) else {
+            return;
+        };
+        self.view = Some((0, first));
+        if self.files.len() == 1 {
+            self.open_file(0, height);
+        } else {
+            self.top = 0;
+            self.scroll(0, height);
+        }
+    }
+
+    /// What is shown, to show the same in a newer document: the file on its
+    /// own (`None` for the list) and the chosen row of the list.
+    pub fn view_state(&self) -> Option<(Option<usize>, usize)> {
+        self.view.map(|_| (self.shown_file(), self.pick))
+    }
+
+    pub fn restore_view(&mut self, state: (Option<usize>, usize), height: usize) {
+        self.one_file_at_a_time(height);
+        match state.0 {
+            Some(n) if n < self.files.len() => self.open_file(n, height),
+            _ if self.files.len() > 1 => {
+                self.pick = state.1.min(self.picks.len().saturating_sub(1));
+            }
+            _ => {}
+        }
+    }
+
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
+
+    /// The list of files is shown.
+    pub fn listing(&self) -> bool {
+        self.view.is_some() && self.shown_file().is_none() && !self.picks.is_empty()
+    }
+
+    /// Index of the file that is shown on its own.
+    pub fn shown_file(&self) -> Option<usize> {
+        let (a, _) = self.view?;
+        self.files.iter().position(|f| f.0 == a)
+    }
+
+    pub fn move_pick(&mut self, by: isize, height: usize) {
+        let last = self.picks.len().saturating_sub(1);
+        self.pick = self.pick.saturating_add_signed(by).min(last);
+        if let Some(&line) = self.picks.get(self.pick) {
+            let row = self.rows.partition_point(|r| r.line < line);
+            let margin = (height / 4).min(3);
+            if row < self.top + margin {
+                self.top = row.saturating_sub(margin);
+            } else if row + margin >= self.top + height {
+                self.top = row + margin + 1 - height.min(row + margin + 1);
+            }
+            self.scroll(0, height);
+        }
+    }
+
+    /// Show the `n`-th file (from 0) on its own.
+    pub fn open_file(&mut self, n: usize, height: usize) {
+        let Some(&(start, _)) = self.files.get(n) else {
+            return;
+        };
+        let end = self.files.get(n + 1).map_or(self.files_end, |f| f.0);
+        self.view = Some((start, end));
+        self.pick = n;
+        self.top = 0;
+        self.scroll(0, height);
+    }
+
+    /// Back to the list of files, at the one that was shown.
+    pub fn open_list(&mut self, height: usize) {
+        if let (Some(_), Some(first)) = (self.view, self.files.first()) {
+            self.view = Some((0, first.0));
+            self.cursor = None;
+            self.anchor = None;
+            self.top = 0;
+            self.move_pick(0, height);
+        }
+    }
+
+    /// Switch to the part that holds this line.
+    fn focus(&mut self, line: u32) {
+        let Some((a, b)) = self.view else { return };
+        if (a..b).contains(&line) {
+            return;
+        }
+        let n = self.files.partition_point(|f| f.0 <= line);
+        let end = |n: usize| self.files.get(n).map_or(self.files_end, |f| f.0);
+        self.view = Some(match n.checked_sub(1) {
+            Some(k) if line < self.files_end => {
+                self.pick = k;
+                (self.files[k].0, end(n))
+            }
+            _ => (0, end(0)),
+        });
     }
 }
 
@@ -1236,6 +1384,62 @@ deleted file mode 100644
     }
 
     #[test]
+    fn changes_are_shown_one_file_at_a_time() {
+        let mut doc = reviewed(vec![
+            thread("gone", Some(1), "LEFT", "on gone"),
+            thread("elsewhere", Some(1), "RIGHT", "other file"),
+        ]);
+        doc.one_file_at_a_time(9);
+        assert!(doc.listing());
+        let rows = all(&doc);
+        assert!(rows.iter().any(|r| r.contains("Changed files (3)")));
+        assert!(rows.iter().any(|r| r.contains("other file")));
+        assert!(!rows.iter().any(|r| r.contains("│")), "no code in the list");
+        // The chosen file is marked; Enter shows it alone.
+        doc.move_pick(2, 9);
+        let chosen: Vec<String> = doc
+            .visible(99)
+            .filter(|r| r.selected)
+            .map(|r| text(&r))
+            .collect();
+        assert!(
+            chosen.len() == 1 && chosen[0].ends_with("gone"),
+            "{chosen:?}"
+        );
+        doc.open_file(2, 9);
+        let rows = all(&doc);
+        assert!(rows[0].contains("gone  (deleted)") && rows.iter().any(|r| r.contains("on gone")));
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.contains("keep") || r.contains("Changed files"))
+        );
+        assert_eq!(doc.current_file().map(|f| (f.0, f.1)), Some((3, 3)));
+        // Moving on goes file by file, and never past the last one.
+        doc.jump(false, 9);
+        assert_eq!(doc.shown_file(), Some(1));
+        doc.jump(true, 9);
+        doc.jump(true, 9);
+        assert_eq!(doc.shown_file(), Some(2));
+        // Line mode and discussions show the file they are in.
+        doc.open_file(0, 9);
+        assert!(doc.jump_thread(true, 9));
+        assert_eq!(doc.shown_file(), Some(2));
+        doc.cursor = None;
+        doc.open_list(9);
+        assert!(doc.listing() && doc.view_state() == Some((None, 2)));
+        doc.move_pick(-9, 9);
+        assert!(doc.start_cursor(9));
+        assert_eq!(doc.shown_file(), Some(0));
+        doc.scroll(isize::MAX, 2);
+        assert!(all(&doc).iter().all(|r| !r.contains("new.png")));
+        // A newer document shows the same file.
+        let mut newer = reviewed(Vec::new());
+        newer.restore_view((Some(1), 1), 9);
+        assert_eq!(newer.shown_file(), Some(1));
+    }
+
+    #[test]
     fn discussions_sit_under_their_line() {
         let mut gone = thread("src/a b.rs", None, "RIGHT", "old talk");
         gone.outdated = true;
@@ -1457,7 +1661,8 @@ deleted file mode 100644
         let find = |t: &str| rows.iter().position(|r| r.contains(t)).unwrap();
         assert_eq!(find("│ end") + 1, find("not accepted · one"));
         assert!(find("accepted · two") < find("│ keep"));
-        assert!(find("· three") > find("gone  (deleted)"));
+        // Those on other files belong to the list of files, before the code.
+        assert!(find("· three") < find("gone  (deleted)"));
         assert!(rows[1].contains("3 findings, 1 accepted"));
         // Discussions and findings are visited in order.
         let mut seen = Vec::new();
@@ -1466,10 +1671,10 @@ deleted file mode 100644
             seen.push((doc.thread_at_cursor(), doc.finding_at_cursor()));
         }
         let want = [
+            (None, Some(2)),
             (None, Some(1)),
             (Some(0), None),
             (None, Some(0)),
-            (None, Some(2)),
         ];
         assert_eq!(seen, want);
         assert!(doc.place().is_err());

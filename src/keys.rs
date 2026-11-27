@@ -91,6 +91,7 @@ pub enum Act {
     Info,
     Web,
     Diff,
+    Comments,
     NextFile,
     PrevFile,
     Checks,
@@ -183,9 +184,8 @@ const PR_VIEW: Group = Group {
     name: "View",
     keys: &[
         k('i', "Info", Act::Info),
-        k('d', "Diff", Act::Diff),
-        k('n', "Files", Act::NextFile),
-        k('N', "", Act::PrevFile),
+        k('d', "Changes", Act::Diff),
+        k('C', "Comments", Act::Comments),
         k('h', "Checks", Act::Checks),
         k('w', "Web", Act::Web),
         k('M', "Raw text", Act::Raw),
@@ -216,6 +216,8 @@ const PR_CODE: Group = Group {
         k('u', "Discussions", Act::NextThread),
         k('U', "", Act::PrevThread),
         k('O', "Resolved", Act::Resolved),
+        k('n', "Files", Act::NextFile),
+        k('N', "", Act::PrevFile),
     ],
 };
 
@@ -383,6 +385,7 @@ pub fn footer(tab: Tab, reading: bool) -> &'static [Act] {
             Ready,
             Merge,
             Diff,
+            Comments,
             Info,
             Raw,
             Resolved,

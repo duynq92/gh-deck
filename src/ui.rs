@@ -710,6 +710,20 @@ fn draw_doc(frame: &mut Frame, app: &mut App, area: Rect) {
             ("u/U", "Discussion"),
             ("Esc", "Leave line mode"),
         ])
+    } else if app.detail_focus && app.doc.listing() {
+        hints(&[
+            ("j/k", "Choose file"),
+            ("Enter", "Show it"),
+            ("l", "Line mode"),
+            ("Esc", "Back"),
+        ])
+    } else if app.detail_focus && app.doc.shown_file().is_some() {
+        hints(&[
+            ("j/k", "Scroll"),
+            ("n/N", "Next/prev file"),
+            ("l", "Line mode"),
+            ("Esc", "All files"),
+        ])
     } else if app.detail_focus {
         hints(&[
             ("j/k", "Scroll"),
@@ -725,11 +739,9 @@ fn draw_doc(frame: &mut Frame, app: &mut App, area: Rect) {
     app.doc_height = height;
     app.doc.layout(inner.width);
     app.doc.scroll(0, height); // clamp after resize
-    let percent = if app.doc.len() > height {
-        let seen = (app.doc.top + height) * 100 / app.doc.len();
-        format!(" {}%", seen.min(100))
-    } else {
-        String::new()
+    let percent = match app.doc.progress(height) {
+        Some(seen) => format!(" {seen}%"),
+        None => String::new(),
     };
     let mut right = Vec::new();
     if let Some((n, count, path)) = app.doc.current_file() {
