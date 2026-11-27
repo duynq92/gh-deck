@@ -837,25 +837,29 @@ pub fn workflows(repo: &str) -> Result<Vec<(String, String)>> {
 pub fn detail(act: Act, item: &Item) -> Result<Source> {
     match (act, item) {
         (Act::Diff | Act::Info, Item::Ticket(t)) if !t.head.is_empty() => pull(act, item, t),
+        (Act::Comments, Item::Ticket(t)) => {
+            let head = format!("{}\n{}#{}", t.title, t.repo, t.number);
+            let body = format!("── Conversation\n{}", text(Act::Info, item)?);
+            Ok(Source::preview(&format!("{head}\n\n{body}")))
+        }
         // Job lists and logs are not Markdown.
         (Act::Info, Item::Ticket(_) | Item::Release(_)) => Ok(Source::preview(&text(act, item)?)),
         _ => Ok(Source::plain(text(act, item)?)),
     }
 }
 
-/// A pull request: its changes and discussions, and for Info its description
-/// and conversation.
+/// A pull request: for Info its description, for Diff its changes with
+/// their discussions. Comments are a document of their own.
 fn pull(act: Act, item: &Item, t: &Ticket) -> Result<Source> {
-    let (diff, talk, comments) = thread::scope(|s| {
-        let diff = s.spawn(|| text(Act::Diff, item));
+    let info = act == Act::Info;
+    let (diff, talk) = thread::scope(|s| {
+        let diff = (!info).then(|| s.spawn(|| text(Act::Diff, item)));
         let talk = s.spawn(|| review::load(&t.repo, t.number));
-        let comments = (act == Act::Info).then(|| text(act, item));
         let lost = || Err(GhError("worker panicked".into()));
         (
-            diff.join().unwrap_or_else(|_| lost()),
+            diff.map(|d| d.join().unwrap_or_else(|_| lost())),
             talk.join()
                 .unwrap_or_else(|_| Err(GhError("worker panicked".into()))),
-            comments,
         )
     });
     let mut source = Source {
@@ -871,26 +875,23 @@ fn pull(act: Act, item: &Item, t: &Ticket) -> Result<Source> {
             review::Talk::default()
         }
     };
-    match comments {
-        Some(comments) => {
-            source.tail = format!("── Conversation\n{}", comments?);
+    match diff {
+        None => {
             let preview = item.preview();
             let (head, body) = preview.split_once("\n\n").unwrap_or((&preview, ""));
-            source.head = format!("{head}\n{}", talk.summary());
-            match diff {
-                Ok(diff) => source.diff = Some(diff),
-                // GitHub refuses very large diffs.
-                Err(e) => missing += &format!("── Changes not available: {e}\n\n"),
-            }
+            let more = "More: [d] Changes, [C] Comments";
+            source.head = format!("{head}\n{}\n{more}", talk.summary());
             source.body = format!("{missing}── Description\n{body}");
+            // Discussions on code are shown with the code.
+            source.oid = talk.oid;
         }
-        None => {
+        Some(diff) => {
             source.diff = Some(diff?);
             source.body = missing;
+            source.threads = talk.threads;
+            source.oid = talk.oid;
         }
     }
-    source.threads = talk.threads;
-    source.oid = talk.oid;
     Ok(source)
 }
 
@@ -916,7 +917,7 @@ fn text(act: Act, item: &Item) -> Result<String> {
                     fields,
                     "--jq",
                     "(if (.reviewDecision//\"\")!=\"\" then \"Review: \\(.reviewDecision|ascii_downcase|gsub(\"_\";\" \"))\\n\" else empty end),([.comments[]|{a:.author.login,t:.createdAt,b:.body,k:\"commented\"}]\
-                     +[.reviews[]?|select(.submittedAt)|{a:.author.login,t:.submittedAt,b:.body,\
+                     +[.reviews[]?|select(.submittedAt and ((.body//\"\")!=\"\" or .state!=\"COMMENTED\"))|{a:.author.login,t:.submittedAt,b:.body,\
                      k:(.state|ascii_downcase)}]|sort_by(.t)[]\
                      |\"── @\\(.a//\"ghost\") \\(.k) · \\(.t[:10])\\n\\(.b)\\n\")",
                 ],

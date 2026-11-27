@@ -613,11 +613,12 @@ impl App {
         self.raw = !self.raw;
         self.save_view();
         let file = self.doc.current_file().map(|f| f.0);
-        let width = self.doc.width();
+        let (width, height, view) = (self.doc.width(), self.doc_height, self.doc.view_state());
         self.doc = Doc::new(&self.source, self.raw);
-        if let Some(n) = file {
-            self.doc.layout(width);
-            let height = self.doc_height;
+        self.doc.layout(width);
+        if let Some(view) = view {
+            self.doc.restore_view(view, height);
+        } else if let Some(n) = file {
             self.doc.show_file(n, height);
         }
     }
@@ -749,7 +750,7 @@ impl App {
                 self.doc_loading = false;
                 match result {
                     Ok(mut d) => {
-                        let top = self.doc.top;
+                        let (top, view) = (self.doc.top, self.doc.view_state());
                         d.show_resolved = self.source.show_resolved;
                         // Line mode goes on: its keys mean something else outside.
                         let mark = self.doc.mark().map(|mark| match mark {
@@ -763,6 +764,14 @@ impl App {
                         });
                         let (width, height) = (self.doc.width(), self.doc_height);
                         self.show(d);
+                        // The changes come one file at a time.
+                        if self.doc_act == Act::Diff {
+                            self.doc.layout(width);
+                            match view {
+                                Some(view) if refresh => self.doc.restore_view(view, height),
+                                _ => self.doc.one_file_at_a_time(height),
+                            }
+                        }
                         // Logs are read from the end; rendering clamps this.
                         self.doc.top = if bottom { usize::MAX } else { top };
                         if let Some(mark) = mark {
@@ -1047,6 +1056,22 @@ impl App {
         if self.detail_focus && self.doc.cursor.is_some() && !ctrl {
             return self.line_key(key);
         }
+        if self.detail_focus && self.doc.listing() && !ctrl {
+            let height = self.doc_height;
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => return self.doc.move_pick(1, height),
+                KeyCode::Char('k') | KeyCode::Up => return self.doc.move_pick(-1, height),
+                KeyCode::Char('g') | KeyCode::Home => {
+                    return self.doc.move_pick(isize::MIN, height);
+                }
+                KeyCode::Char('G') | KeyCode::End => return self.doc.move_pick(isize::MAX, height),
+                KeyCode::Enter => {
+                    let n = self.doc.view_state().map_or(0, |v| v.1);
+                    return self.doc.open_file(n, height);
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Char('d') if ctrl => self.step(self.page() / 2),
             KeyCode::Char('u') if ctrl => self.step(-self.page() / 2),
@@ -1062,7 +1087,15 @@ impl App {
                 self.switch((self.tab.bar() as usize + Tab::BAR.len() - 1) % Tab::BAR.len())
             }
             KeyCode::Char(c @ '1'..='5') => self.switch(c as usize - '1' as usize),
-            KeyCode::Enter if !self.detail_focus => self.open_doc(Act::Info),
+            KeyCode::Enter if !self.detail_focus => {
+                // Comments are shown with the code they are about, or with the others.
+                let act = match self.list().selected() {
+                    Some(Item::Event(e)) if e.comment.is_some() => Act::Diff,
+                    Some(Item::Event(e)) if e.text.starts_with(['◆', '@']) => Act::Comments,
+                    _ => Act::Info,
+                };
+                self.open_doc(act);
+            }
             KeyCode::Esc => self.back(),
             KeyCode::Char(c) => {
                 if let Some(act) = keys::lookup(self.tab, c) {
@@ -1074,7 +1107,10 @@ impl App {
     }
 
     fn back(&mut self) {
-        if self.detail_focus {
+        if self.detail_focus && self.doc.shown_file().is_some() && self.doc.file_count() > 1 {
+            let height = self.doc_height;
+            self.doc.open_list(height);
+        } else if self.detail_focus {
             self.detail_focus = false;
             self.zoom = false;
             self.pending = None;
@@ -1239,7 +1275,9 @@ impl App {
                     self.refresh_doc();
                 }
             }
-            Act::Info | Act::Diff | Act::Checks | Act::Log | Act::FailedLog => self.open_doc(act),
+            Act::Info | Act::Diff | Act::Comments | Act::Checks | Act::Log | Act::FailedLog => {
+                self.open_doc(act)
+            }
             Act::New | Act::Trigger => match self.scope.as_slice() {
                 [(_, repo)] => self.target(act, repo.clone()),
                 _ => self.pick_target(act),
@@ -1408,7 +1446,8 @@ impl App {
 
     /// Run an action once the changes are there, loading them if needed.
     fn when_loaded(&mut self, act: Act, open: Act) {
-        if !self.doc_loading {
+        // Info may still be loading; it has no code.
+        if !self.doc_loading || self.doc_act != open {
             self.open_doc(open);
         }
         if self.doc_loading {
@@ -1452,12 +1491,15 @@ impl App {
 
     /// Draw the document again, at the same place.
     fn rebuild(&mut self) {
-        let (mark, top) = (self.doc.mark(), self.doc.top);
+        let (mark, top, view) = (self.doc.mark(), self.doc.top, self.doc.view_state());
         let (width, height) = (self.doc.width(), self.doc_height);
         self.doc = Doc::new(&self.source, self.raw);
+        self.doc.layout(width);
+        if let Some(view) = view {
+            self.doc.restore_view(view, height);
+        }
         self.doc.top = top;
         if let Some(mark) = mark {
-            self.doc.layout(width);
             self.doc.seek(&mark, height);
         }
     }
@@ -1543,7 +1585,7 @@ impl App {
         };
         let repo = t.repo.clone();
         if self.source.diff.is_none() || self.source.oid.is_empty() {
-            return self.when_loaded(Act::Ai, Act::Info);
+            return self.when_loaded(Act::Ai, Act::Diff);
         }
         if self.ai.blocks(&repo) {
             return self.error(format!("{repo} is blocked in ai.json"));
@@ -1719,6 +1761,9 @@ impl App {
         let Some(item) = self.current().cloned() else {
             return;
         };
+        if self.source.diff.is_none() && self.reviews.contains_key(&item.id()) {
+            return self.when_loaded(Act::AiPost, Act::Diff); // findings are on the code
+        }
         let Some(review) = self.source.ai.as_ref().filter(|r| r.accepted() > 0) else {
             return self.error("accept findings first: A, then Space");
         };
@@ -3177,6 +3222,71 @@ mod tests {
         press(&mut app, KeyCode::Char('5'));
         press(&mut app, KeyCode::Char('f'));
         assert!(app.tab == Tab::Prs && matches!(app.modal, Some(Modal::Picker(_))));
+    }
+
+    #[test]
+    fn code_is_in_its_own_panel() {
+        let mut app = app();
+        app.listed(Tab::Prs, 0, false, page(&[1]));
+        app.feed(
+            Tab::Activity,
+            false,
+            events(&[("a", 1, false), ("b", 1, false)]),
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.doc_act, Act::Info);
+        // Line comments need the code: Changes opens in the same place.
+        press(&mut app, KeyCode::Char('l'));
+        assert!(app.doc_act == Act::Diff && app.doc_loading);
+        press(&mut app, KeyCode::Char('i'));
+        assert_eq!(app.doc_act, Act::Info);
+        press(&mut app, KeyCode::Char('C'));
+        assert!(app.doc_act == Act::Comments && app.detail_focus);
+        press(&mut app, KeyCode::Esc);
+        // A comment that is not on code opens the comments.
+        press(&mut app, KeyCode::Char('5'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.doc_act, Act::Comments);
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.doc_act, Act::Diff);
+    }
+
+    #[test]
+    fn changes_open_on_the_list_of_files() {
+        let two = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n\
+                   diff --git a/g b/g\n--- a/g\n+++ b/g\n@@ -1 +1 @@\n-c\n+d\n";
+        let mut app = app();
+        app.listed(Tab::Prs, 0, false, page(&[1]));
+        press(&mut app, KeyCode::Char('d'));
+        let source = Source {
+            diff: Some(two.into()),
+            oid: "abc".into(),
+            ..Source::default()
+        };
+        app.feed_doc(false, Ok(source));
+        assert!(app.doc.listing());
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.doc.shown_file(), Some(1));
+        press(&mut app, KeyCode::Char('N'));
+        assert_eq!(app.doc.shown_file(), Some(0));
+        // Reloading keeps the file.
+        app.feed_doc(true, Ok(app_source(two)));
+        assert_eq!(app.doc.shown_file(), Some(0));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.doc.listing() && app.detail_focus);
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.detail_focus);
+    }
+
+    fn app_source(diff: &str) -> Source {
+        Source {
+            diff: Some(diff.into()),
+            oid: "abc".into(),
+            ..Source::default()
+        }
     }
 
     #[test]
